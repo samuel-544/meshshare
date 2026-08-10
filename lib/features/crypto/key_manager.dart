@@ -28,7 +28,7 @@ class KeyManager {
   static const String _keyFileName = 'meshshare_static_key.bin';
 
   static final _x25519 = X25519();
-  static final _sha256  = Sha256();
+  static final _sha256 = Sha256();
 
   final Directory _dir;
 
@@ -99,7 +99,7 @@ class KeyManager {
   ///
   /// [peerId] should be the hex identity string of the remote peer.
   void storeSession(String peerId, SecretKey sendKey, SecretKey receiveKey) {
-    _sessionSendKeys[peerId]    = sendKey;
+    _sessionSendKeys[peerId] = sendKey;
     _sessionReceiveKeys[peerId] = receiveKey;
   }
 
@@ -123,11 +123,11 @@ class KeyManager {
 
   Future<SimpleKeyPairData> _generateAndSaveKeyPair(File keyFile) async {
     final keyPair = await _x25519.newKeyPair();
-    final data    = await keyPair.extract();
+    final data = await keyPair.extract();
 
     // Store: 32-byte private key || 32-byte public key
     final bytes = Uint8List(64);
-    bytes.setAll(0,  data.bytes);
+    bytes.setAll(0, data.bytes);
     bytes.setAll(32, data.publicKey.bytes);
     await keyFile.writeAsBytes(bytes, flush: true);
 
@@ -137,10 +137,12 @@ class KeyManager {
   Future<SimpleKeyPairData> _loadKeyPair(File keyFile) async {
     final bytes = await keyFile.readAsBytes();
     if (bytes.length != 64) {
-      throw StateError('Key file is corrupt (expected 64 bytes, got ${bytes.length}).');
+      throw StateError(
+        'Key file is corrupt (expected 64 bytes, got ${bytes.length}).',
+      );
     }
     final privateBytes = bytes.sublist(0, 32);
-    final publicBytes  = bytes.sublist(32, 64);
+    final publicBytes = bytes.sublist(32, 64);
     return SimpleKeyPairData(
       privateBytes,
       publicKey: SimplePublicKey(publicBytes, type: KeyPairType.x25519),

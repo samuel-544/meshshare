@@ -6,7 +6,10 @@ class MeshNode {
   final Uint8List identity;
 
   /// BLE device ID (platform-specific, may rotate — use [identity] for tracking).
-  final String deviceId;
+  ///
+  /// Null if this peer is known only via mesh gossip or a routed (multi-hop)
+  /// Noise session, with no direct GATT link to this device.
+  final String? deviceId;
 
   /// Human-readable display name (if advertised).
   final String? displayName;
@@ -19,11 +22,14 @@ class MeshNode {
 
   const MeshNode({
     required this.identity,
-    required this.deviceId,
+    this.deviceId,
     this.displayName,
     required this.rssi,
     required this.lastSeenMs,
   });
+
+  /// Whether this node has a live GATT link (direct neighbor).
+  bool get isDirect => deviceId != null;
 
   /// Hex string of the first 8 bytes of identity — used as short display ID.
   String get shortId =>

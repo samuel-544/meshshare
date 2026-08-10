@@ -22,6 +22,7 @@
     <!-- Foreground service (keep BLE alive with screen off) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- File storage (save received files) -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"

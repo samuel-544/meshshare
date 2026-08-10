@@ -28,8 +28,9 @@ class MessageStore extends ChangeNotifier {
   /// If a message with [message.messageId] already exists it is replaced
   /// (used to update status from [MessageStatus.sending] → delivered/failed).
   void upsert(TextMessage message) {
-    final peerId =
-        message.isOutgoing ? message.recipientPeerId : message.senderPeerId;
+    final peerId = message.isOutgoing
+        ? message.recipientPeerId
+        : message.senderPeerId;
 
     _conversations.putIfAbsent(peerId, () => []);
     final thread = _conversations[peerId]!;

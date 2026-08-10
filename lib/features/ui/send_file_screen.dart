@@ -9,6 +9,8 @@ import '../bluetooth/mesh_node.dart';
 import '../file_transfer/chunk_model.dart';
 import '../file_transfer/transfer_manager.dart';
 import '../file_transfer/transfer_progress.dart';
+import '../peers/peer_contact_store.dart';
+import 'demo_transfer_trace.dart';
 import 'transfer_progress_screen.dart';
 
 class SendFileScreen extends StatefulWidget {
@@ -23,6 +25,7 @@ class SendFileScreen extends StatefulWidget {
 class _SendFileScreenState extends State<SendFileScreen> {
   PlatformFile? _selectedFile;
   TransferProgress? _progress;
+  final List<String> _demoTrace = [];
   StreamSubscription<TransferProgress>? _progressSub;
   bool _sending = false;
 
@@ -38,15 +41,20 @@ class _SendFileScreenState extends State<SendFileScreen> {
     setState(() {
       _selectedFile = result.files.first;
       _progress = null;
+      _demoTrace.clear();
     });
   }
 
   Future<void> _sendFile() async {
     final file = _selectedFile;
     if (file?.path == null) return;
+    final selectedFile = file!;
 
     final tm = context.read<TransferManager>();
-    setState(() => _sending = true);
+    setState(() {
+      _sending = true;
+      _demoTrace.clear();
+    });
 
     _progressSub?.cancel();
     _progressSub = tm.progress.listen((p) {
@@ -60,28 +68,41 @@ class _SendFileScreenState extends State<SendFileScreen> {
       if (!Platform.isAndroid && !Platform.isIOS) {
         // Demo mode: animate a fake transfer progress without real BLE.
         final transferId = 'demo-${DateTime.now().millisecondsSinceEpoch}';
+        final events = [
+          'Selected "${selectedFile.name}" and split it into encrypted chunks.',
+          'Noise_XX demo session key established with ${widget.target.displayName ?? widget.target.shortId}.',
+          'Chunk 1 encrypted with ChaCha20-Poly1305: 0x8f2a...c91e.',
+          'Chunk 1 forwarded Sender -> Relay Node #1 -> Receiver.',
+          'Receiver verified MAC tag and SHA-256 checksum.',
+          'Chunks reassembled and ACK returned to sender.',
+        ];
         for (int step = 1; step <= 10; step++) {
           await Future.delayed(const Duration(milliseconds: 250));
           if (!mounted) return;
-          setState(() => _progress = TransferProgress(
-                transferId: transferId,
-                label: file!.name,
-                progress: step / 10,
-                status: step < 10
-                    ? TransferStatus.sending
-                    : TransferStatus.complete,
-                type: PayloadType.file,
-                peerId: widget.target.shortId,
-              ));
+          setState(() {
+            if (step <= events.length) {
+              _demoTrace.add(events[step - 1]);
+            }
+            _progress = TransferProgress(
+              transferId: transferId,
+              label: selectedFile.name,
+              progress: step / 10,
+              status: step < 10
+                  ? TransferStatus.sending
+                  : TransferStatus.complete,
+              type: PayloadType.file,
+              peerId: widget.target.shortId,
+            );
+          });
         }
         return;
       }
-      await tm.sendFile(filePath: file!.path!, target: widget.target);
+      await tm.sendFile(filePath: selectedFile.path!, target: widget.target);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Send failed: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Send failed: $e')));
       }
     } finally {
       if (mounted) setState(() => _sending = false);
@@ -99,13 +120,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
     final p = _progress;
     final isDone = p?.status == TransferStatus.complete;
     final isFailed = p?.status == TransferStatus.failed;
+    final recipientName = context.watch<PeerContactStore>().nameFor(
+      widget.target.shortId,
+      fallback: widget.target.displayName,
+    );
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          'Send to ${widget.target.displayName ?? widget.target.shortId.substring(0, 8)}',
-        ),
-      ),
+      appBar: AppBar(title: Text('Send to $recipientName')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -118,8 +139,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('File',
-                        style: Theme.of(context).textTheme.labelLarge),
+                    Text('File', style: Theme.of(context).textTheme.labelLarge),
                     const SizedBox(height: 8),
                     if (_selectedFile == null)
                       OutlinedButton.icon(
@@ -139,13 +159,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
                                 Text(
                                   _selectedFile!.name,
                                   style: const TextStyle(
-                                      fontWeight: FontWeight.w600),
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                   overflow: TextOverflow.ellipsis,
                                 ),
                                 Text(
                                   _formatBytes(_selectedFile!.size),
-                                  style:
-                                      Theme.of(context).textTheme.bodySmall,
+                                  style: Theme.of(context).textTheme.bodySmall,
                                 ),
                               ],
                             ),
@@ -166,8 +186,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
             Card(
               child: ListTile(
                 leading: const Icon(Icons.person_outline),
-                title: Text(
-                    widget.target.displayName ?? 'Unknown Device'),
+                title: Text(recipientName),
                 subtitle: Text(widget.target.shortId),
               ),
             ),
@@ -175,6 +194,10 @@ class _SendFileScreenState extends State<SendFileScreen> {
             // Transfer progress
             if (p != null) ...[
               TransferProgressWidget(progress: p),
+              const SizedBox(height: 16),
+            ],
+            if (_demoTrace.isNotEmpty) ...[
+              DemoTransferTrace(events: _demoTrace),
               const SizedBox(height: 16),
             ],
             // Action button
@@ -192,8 +215,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
               )
             else
               FilledButton.icon(
-                onPressed:
-                    (_selectedFile != null && !_sending) ? _sendFile : null,
+                onPressed: (_selectedFile != null && !_sending)
+                    ? _sendFile
+                    : null,
                 icon: _sending
                     ? const SizedBox(
                         width: 18,

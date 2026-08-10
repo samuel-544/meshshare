@@ -37,7 +37,9 @@ class FileAssembler {
   /// Throws [Exception] if a chunk's checksum does not match.
   Future<Uint8List> assemble() async {
     if (!isComplete) {
-      throw StateError('Cannot assemble: missing ${missingChunks.length} chunks.');
+      throw StateError(
+        'Cannot assemble: missing ${missingChunks.length} chunks.',
+      );
     }
 
     final sha256 = Sha256();
@@ -49,7 +51,8 @@ class FileAssembler {
       final hash = await sha256.hash(chunk.data);
       if (!_bytesEqual(Uint8List.fromList(hash.bytes), chunk.checksum)) {
         throw Exception(
-            'Checksum mismatch on chunk ${chunk.chunkIndex} of $fileId');
+          'Checksum mismatch on chunk ${chunk.chunkIndex} of $fileId',
+        );
       }
       buffer.addAll(chunk.data);
     }

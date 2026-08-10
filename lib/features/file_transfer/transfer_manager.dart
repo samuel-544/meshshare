@@ -24,8 +24,8 @@ import 'transfer_progress.dart';
 class _OutgoingTransfer {
   final String transferId;
   final String label;
-  final List<FileChunk> chunks;    // all encrypted chunks
-  final Set<int> ackedIndices;     // chunkIndices confirmed by receiver
+  final List<FileChunk> chunks; // all encrypted chunks
+  final Set<int> ackedIndices; // chunkIndices confirmed by receiver
   final MeshNode target;
   final PayloadType type;
   int retryCount = 0;
@@ -56,12 +56,14 @@ class _IncomingTransfer {
   final String senderPeerId;
   final PayloadType type;
   final String label;
+  final String? fileName;
 
   _IncomingTransfer({
     required this.assembler,
     required this.senderPeerId,
     required this.type,
     required this.label,
+    this.fileName,
   });
 }
 
@@ -99,11 +101,11 @@ class TransferManager {
   final Map<String, _IncomingTransfer> _incoming = {};
 
   // Progress events
-  final _progressController =
-      StreamController<TransferProgress>.broadcast();
+  final _progressController = StreamController<TransferProgress>.broadcast();
 
   // Saved file events
   final _savedFileController = StreamController<SavedFile>.broadcast();
+  final List<SavedFile> _savedFiles = [];
 
   /// Live progress updates for all active transfers.
   Stream<TransferProgress> get progress => _progressController.stream;
@@ -111,13 +113,16 @@ class TransferManager {
   /// Emits once per received file after it is saved to disk.
   Stream<SavedFile> get savedFiles => _savedFileController.stream;
 
+  /// Files received during this app session.
+  List<SavedFile> get receivedFiles => List.unmodifiable(_savedFiles);
+
   TransferManager({
     required BleMeshService ble,
     required KeyManager keys,
     required MessageStore messageStore,
-  })  : _ble = ble,
-        _keys = keys,
-        _messageStore = messageStore {
+  }) : _ble = ble,
+       _keys = keys,
+       _messageStore = messageStore {
     // Wire up incoming encrypted chunks.
     _ble.incomingChunks.listen(_onIncomingEncryptedChunk);
     // Wire up ACKs from the BLE layer.
@@ -145,7 +150,14 @@ class TransferManager {
     }
 
     final label = p.basename(filePath);
-    final chunks = await FileChunker.chunkFile(bytes, type: PayloadType.file);
+    final localShortId = (await _keys.localPeerId()).substring(0, 16);
+    final chunks = await FileChunker.chunkFile(
+      bytes,
+      originPeerId: localShortId,
+      destPeerId: target.shortId,
+      type: PayloadType.file,
+      fileName: label,
+    );
     await _startOutgoing(
       chunks: chunks,
       label: label,
@@ -162,8 +174,11 @@ class TransferManager {
     // Store as sending before we start.
     _messageStore.upsert(message);
 
+    final localShortId = (await _keys.localPeerId()).substring(0, 16);
     final chunks = await FileChunker.chunkFile(
       message.toBytes(),
+      originPeerId: localShortId,
+      destPeerId: target.shortId,
       type: PayloadType.message,
       transferId: message.messageId,
     );
@@ -191,8 +206,9 @@ class TransferManager {
     final sendKey = _keys.sessionSendKey(target.shortId);
     if (sendKey == null) {
       throw StateError(
-          'No active session with peer ${target.shortId}. '
-          'Complete Noise_XX handshake first.');
+        'No active session with peer ${target.shortId}. '
+        'Complete Noise_XX handshake first.',
+      );
     }
 
     // Encrypt every chunk before sending.
@@ -229,7 +245,8 @@ class TransferManager {
       transfer.retransmitTimer?.cancel();
       _outgoing.remove(transfer.transferId);
       _emitProgressEvent(
-          transfer.copyWith(progress: 1.0, status: TransferStatus.complete));
+        transfer.copyWith(progress: 1.0, status: TransferStatus.complete),
+      );
       if (transfer.type == PayloadType.message) {
         _messageStore.markDelivered(transfer.transferId, ack.peerId);
       }
@@ -256,7 +273,11 @@ class TransferManager {
       transfer.retransmitTimer?.cancel();
       _outgoing.remove(transfer.transferId);
       _emitProgressEvent(
-          transfer.copyWith(progress: transfer.progress, status: TransferStatus.failed));
+        transfer.copyWith(
+          progress: transfer.progress,
+          status: TransferStatus.failed,
+        ),
+      );
       if (transfer.type == PayloadType.message) {
         _messageStore.markFailed(transfer.transferId, transfer.target.shortId);
       }
@@ -270,7 +291,7 @@ class TransferManager {
   Future<void> _sendUnacked(_OutgoingTransfer transfer) async {
     for (final chunk in transfer.unackedChunks) {
       try {
-        await _ble.sendChunk(chunk, transfer.target);
+        await _ble.sendChunk(chunk);
       } catch (_) {
         // Best-effort per chunk; overall retransmit timer will catch failures.
       }
@@ -280,10 +301,7 @@ class TransferManager {
   // ── Receive ───────────────────────────────────────────────────────────────
 
   Future<void> _onIncomingEncryptedChunk(FileChunk encrypted) async {
-    // Identify the sender by peerId (set on chunk by BLE layer — see note below).
-    // For now we use a placeholder; the BLE layer stamps senderPeerId via a
-    // wrapper that will be wired in the integration phase.
-    final senderPeerId = encrypted.fileId.substring(0, 8); // placeholder
+    final senderPeerId = encrypted.originPeerId;
 
     final receiveKey = _keys.sessionReceiveKey(senderPeerId);
     if (receiveKey == null) return; // no session — drop silently
@@ -300,13 +318,13 @@ class TransferManager {
     final checksumOk = await _verifyChecksum(decrypted);
     if (!checksumOk) return;
 
-    // Send ACK back to sender.
+    // Send ACK back to the original sender — routed by identity, not by a
+    // live GATT link, so this works even when the sender is multiple hops
+    // away.
     await _ble.sendAck(
       fileId: decrypted.fileId,
       chunkIndex: decrypted.chunkIndex,
-      target: _ble.connectedPeers
-          .where((n) => n.shortId == senderPeerId)
-          .firstOrNull,
+      originPeerId: senderPeerId,
     );
 
     // Get or create an assembler for this transfer.
@@ -319,21 +337,24 @@ class TransferManager {
         ),
         senderPeerId: senderPeerId,
         type: decrypted.payloadType,
-        label: decrypted.fileId.substring(0, 8),
+        label: decrypted.fileName ?? decrypted.fileId.substring(0, 8),
+        fileName: decrypted.fileName,
       ),
     );
 
     final isNew = incoming.assembler.addChunk(decrypted);
     if (!isNew) return; // duplicate
 
-    _progressController.add(TransferProgress(
-      transferId: decrypted.fileId,
-      label: incoming.label,
-      progress: incoming.assembler.progress,
-      status: TransferStatus.receiving,
-      type: decrypted.payloadType,
-      peerId: senderPeerId,
-    ));
+    _progressController.add(
+      TransferProgress(
+        transferId: decrypted.fileId,
+        label: incoming.label,
+        progress: incoming.assembler.progress,
+        status: TransferStatus.receiving,
+        type: decrypted.payloadType,
+        peerId: senderPeerId,
+      ),
+    );
 
     if (incoming.assembler.isComplete) {
       await _finalise(incoming);
@@ -358,7 +379,7 @@ class TransferManager {
       final msg = TextMessage(
         messageId: assembler.fileId,
         senderPeerId: incoming.senderPeerId,
-        recipientPeerId: await _keys.localPeerId(),
+        recipientPeerId: (await _keys.localPeerId()).substring(0, 16),
         content: content,
         timestampMs: DateTime.now().millisecondsSinceEpoch,
         isOutgoing: false,
@@ -368,28 +389,37 @@ class TransferManager {
     } else {
       // Save to the app's downloads directory.
       final dir = await getApplicationDocumentsDirectory();
-      final savePath =
-          '${dir.path}/MeshShare/${assembler.fileId.substring(0, 8)}_received';
+      final safeName = _safeFileName(
+        incoming.fileName ?? '${assembler.fileId.substring(0, 8)}_received',
+      );
+      final savePath = await _availableSavePath(
+        '${dir.path}/MeshShare',
+        safeName,
+      );
       await File(savePath).parent.create(recursive: true);
       await File(savePath).writeAsBytes(bytes, flush: true);
 
-      _savedFileController.add(SavedFile(
+      final savedFile = SavedFile(
         path: savePath,
         name: p.basename(savePath),
         sizeBytes: bytes.length,
         senderPeerId: incoming.senderPeerId,
         receivedAt: DateTime.now(),
-      ));
+      );
+      _savedFiles.insert(0, savedFile);
+      _savedFileController.add(savedFile);
     }
 
-    _progressController.add(TransferProgress(
-      transferId: assembler.fileId,
-      label: incoming.label,
-      progress: 1.0,
-      status: TransferStatus.complete,
-      type: incoming.type,
-      peerId: incoming.senderPeerId,
-    ));
+    _progressController.add(
+      TransferProgress(
+        transferId: assembler.fileId,
+        label: incoming.label,
+        progress: 1.0,
+        status: TransferStatus.complete,
+        type: incoming.type,
+        peerId: incoming.senderPeerId,
+      ),
+    );
   }
 
   // ── Cancel ────────────────────────────────────────────────────────────────
@@ -400,7 +430,11 @@ class TransferManager {
     if (transfer == null) return;
     transfer.retransmitTimer?.cancel();
     _emitProgressEvent(
-        transfer.copyWith(progress: transfer.progress, status: TransferStatus.failed));
+      transfer.copyWith(
+        progress: transfer.progress,
+        status: TransferStatus.failed,
+      ),
+    );
   }
 
   void dispose() {
@@ -414,14 +448,18 @@ class TransferManager {
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   void _emitProgress(_OutgoingTransfer transfer) {
-    _progressController.add(TransferProgress(
-      transferId: transfer.transferId,
-      label: transfer.label,
-      progress: transfer.progress,
-      status: transfer.isComplete ? TransferStatus.complete : TransferStatus.sending,
-      type: transfer.type,
-      peerId: transfer.target.shortId,
-    ));
+    _progressController.add(
+      TransferProgress(
+        transferId: transfer.transferId,
+        label: transfer.label,
+        progress: transfer.progress,
+        status: transfer.isComplete
+            ? TransferStatus.complete
+            : TransferStatus.sending,
+        type: transfer.type,
+        peerId: transfer.target.shortId,
+      ),
+    );
   }
 
   void _emitProgressEvent(TransferProgress event) {
@@ -437,12 +475,33 @@ class TransferManager {
       return false;
     }
   }
+
+  String _safeFileName(String name) {
+    final baseName = p.basename(name).replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final trimmed = baseName.trim();
+    return trimmed.isEmpty ? 'received_file' : trimmed;
+  }
+
+  Future<String> _availableSavePath(String directory, String fileName) async {
+    var candidate = p.join(directory, fileName);
+    if (!await File(candidate).exists()) return candidate;
+
+    final extension = p.extension(fileName);
+    final stem = p.basenameWithoutExtension(fileName);
+    for (var i = 1; ; i++) {
+      candidate = p.join(directory, '$stem ($i)$extension');
+      if (!await File(candidate).exists()) return candidate;
+    }
+  }
 }
 
 // Extension for copying _OutgoingTransfer with new progress/status fields —
 // used only in _emitProgress so we don't expose mutable state.
 extension on _OutgoingTransfer {
-  TransferProgress copyWith({double? progress, required TransferStatus status}) {
+  TransferProgress copyWith({
+    double? progress,
+    required TransferStatus status,
+  }) {
     return TransferProgress(
       transferId: transferId,
       label: label,

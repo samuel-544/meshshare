@@ -17,12 +17,10 @@ void main() {
 
   group('Encrypt → chunk → decrypt → assemble pipeline', () {
     late SecretKey sendKey;
-    late SecretKey receiveKey;
 
     setUp(() async {
       final algo = Chacha20.poly1305Aead();
-      sendKey    = await algo.newSecretKey();
-      receiveKey = await algo.newSecretKey();
+      sendKey = await algo.newSecretKey();
     });
 
     test('file bytes survive a full round trip', () async {
@@ -31,7 +29,7 @@ void main() {
       );
 
       // Sender side: chunk → encrypt
-      final plainChunks = await FileChunker.chunkFile(original);
+      final plainChunks = await FileChunker.chunkFile(original, originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb');
       final encryptedChunks = <FileChunk>[];
       for (final chunk in plainChunks) {
         encryptedChunks.add(await AeadCipher.encryptChunk(chunk, sendKey));
@@ -53,7 +51,7 @@ void main() {
 
     test('out-of-order encrypted chunks are reassembled correctly', () async {
       final original = Uint8List.fromList(List.generate(100, (i) => i));
-      final plainChunks = await FileChunker.chunkFile(original);
+      final plainChunks = await FileChunker.chunkFile(original, originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb');
 
       final encrypted = <FileChunk>[];
       for (final c in plainChunks) {
@@ -76,26 +74,31 @@ void main() {
       expect(result, equals(original));
     });
 
-    test('tampered chunk is rejected before it reaches the assembler', () async {
-      final plain = (await FileChunker.chunkFile(Uint8List(20))).first;
-      final enc   = await AeadCipher.encryptChunk(plain, sendKey);
+    test(
+      'tampered chunk is rejected before it reaches the assembler',
+      () async {
+        final plain = (await FileChunker.chunkFile(Uint8List(20), originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb')).first;
+        final enc = await AeadCipher.encryptChunk(plain, sendKey);
 
-      final tampered = Uint8List.fromList(enc.data);
-      tampered[0] ^= 0xff;
-      final tamperedChunk = FileChunk(
-        fileId: enc.fileId,
-        chunkIndex: enc.chunkIndex,
-        totalChunks: enc.totalChunks,
-        data: tampered,
-        checksum: enc.checksum,
-        ttl: enc.ttl,
-      );
+        final tampered = Uint8List.fromList(enc.data);
+        tampered[0] ^= 0xff;
+        final tamperedChunk = FileChunk(
+          fileId: enc.fileId,
+          chunkIndex: enc.chunkIndex,
+          totalChunks: enc.totalChunks,
+          data: tampered,
+          checksum: enc.checksum,
+          ttl: enc.ttl,
+          originPeerId: enc.originPeerId,
+          destPeerId: enc.destPeerId,
+        );
 
-      expect(
-        () => AeadCipher.decryptChunk(tamperedChunk, sendKey),
-        throwsA(isA<SecretBoxAuthenticationError>()),
-      );
-    });
+        expect(
+          () => AeadCipher.decryptChunk(tamperedChunk, sendKey),
+          throwsA(isA<SecretBoxAuthenticationError>()),
+        );
+      },
+    );
   });
 
   // ── TransferProgress model ─────────────────────────────────────────────────
@@ -111,12 +114,15 @@ void main() {
         peerId: 'peer1',
       );
 
-      final updated = p.copyWith(progress: 1.0, status: TransferStatus.complete);
+      final updated = p.copyWith(
+        progress: 1.0,
+        status: TransferStatus.complete,
+      );
 
       expect(updated.progress, equals(1.0));
       expect(updated.status, equals(TransferStatus.complete));
       expect(updated.label, equals('file.txt')); // unchanged
-      expect(updated.peerId, equals('peer1'));    // unchanged
+      expect(updated.peerId, equals('peer1')); // unchanged
     });
   });
 
@@ -136,8 +142,10 @@ void main() {
       );
       store.upsert(msg);
       store.markDelivered('msg-001', 'peer-b');
-      expect(store.messagesFor('peer-b').first.status,
-          equals(MessageStatus.delivered));
+      expect(
+        store.messagesFor('peer-b').first.status,
+        equals(MessageStatus.delivered),
+      );
     });
 
     test('markFailed transitions status to failed', () {
@@ -153,8 +161,10 @@ void main() {
       );
       store.upsert(msg);
       store.markFailed('msg-002', 'peer-b');
-      expect(store.messagesFor('peer-b').first.status,
-          equals(MessageStatus.failed));
+      expect(
+        store.messagesFor('peer-b').first.status,
+        equals(MessageStatus.failed),
+      );
     });
   });
 
@@ -172,7 +182,7 @@ void main() {
     });
 
     test('session keys survive store and retrieve cycle', () async {
-      final km   = KeyManager.forTesting(tmpDir);
+      final km = KeyManager.forTesting(tmpDir);
       final algo = Chacha20.poly1305Aead();
       final send = await algo.newSecretKey();
       final recv = await algo.newSecretKey();
@@ -190,24 +200,33 @@ void main() {
       expect(sendBytes1, equals(sendBytes2));
     });
 
-    test('encrypt with send key decrypts with same key (session simulation)', () async {
-      final km   = KeyManager.forTesting(tmpDir);
-      final algo = Chacha20.poly1305Aead();
-      final key  = await algo.newSecretKey();
+    test(
+      'encrypt with send key decrypts with same key (session simulation)',
+      () async {
+        final km = KeyManager.forTesting(tmpDir);
+        final algo = Chacha20.poly1305Aead();
+        final key = await algo.newSecretKey();
 
-      km.storeSession('peer-x', key, key); // use same key both ways for test
+        km.storeSession('peer-x', key, key); // use same key both ways for test
 
-      final plain = (await FileChunker.chunkFile(
-        Uint8List.fromList(List.generate(20, (i) => i)),
-      )).first;
+        final plain = (await FileChunker.chunkFile(
+          Uint8List.fromList(List.generate(20, (i) => i)),
+          originPeerId: 'aaaaaaaaaaaaaaaa',
+          destPeerId: 'bbbbbbbbbbbbbbbb',
+        )).first;
 
-      final enc = await AeadCipher.encryptChunk(
-          plain, km.sessionSendKey('peer-x')!);
-      final dec = await AeadCipher.decryptChunk(
-          enc, km.sessionReceiveKey('peer-x')!);
+        final enc = await AeadCipher.encryptChunk(
+          plain,
+          km.sessionSendKey('peer-x')!,
+        );
+        final dec = await AeadCipher.decryptChunk(
+          enc,
+          km.sessionReceiveKey('peer-x')!,
+        );
 
-      expect(dec.data, equals(plain.data));
-    });
+        expect(dec.data, equals(plain.data));
+      },
+    );
   });
 
   // ── SavedFile model ───────────────────────────────────────────────────────

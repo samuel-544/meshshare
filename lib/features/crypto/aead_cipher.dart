@@ -53,9 +53,13 @@ class AeadCipher {
       chunkIndex: chunk.chunkIndex,
       totalChunks: chunk.totalChunks,
       data: encrypted,
-      checksum: chunk.checksum, // SHA-256 of plaintext — kept for post-decrypt verify
+      checksum:
+          chunk.checksum, // SHA-256 of plaintext — kept for post-decrypt verify
       ttl: chunk.ttl,
       payloadType: chunk.payloadType,
+      originPeerId: chunk.originPeerId,
+      destPeerId: chunk.destPeerId,
+      fileName: chunk.fileName,
     );
   }
 
@@ -92,6 +96,9 @@ class AeadCipher {
       checksum: chunk.checksum,
       ttl: chunk.ttl,
       payloadType: chunk.payloadType,
+      originPeerId: chunk.originPeerId,
+      destPeerId: chunk.destPeerId,
+      fileName: chunk.fileName,
     );
   }
 
@@ -105,12 +112,15 @@ class AeadCipher {
     final fileIdBytes = utf8.encode(fileId);
     input.setAll(0, fileIdBytes);
     // Append chunkIndex as big-endian uint32.
-    input[fileId.length]     = (chunkIndex >> 24) & 0xff;
+    input[fileId.length] = (chunkIndex >> 24) & 0xff;
     input[fileId.length + 1] = (chunkIndex >> 16) & 0xff;
-    input[fileId.length + 2] = (chunkIndex >> 8)  & 0xff;
-    input[fileId.length + 3] =  chunkIndex        & 0xff;
+    input[fileId.length + 2] = (chunkIndex >> 8) & 0xff;
+    input[fileId.length + 3] = chunkIndex & 0xff;
 
     final hash = await _sha256.hash(input);
-    return hash.bytes.sublist(0, 12); // ChaCha20-Poly1305 requires exactly 12 bytes
+    return hash.bytes.sublist(
+      0,
+      12,
+    ); // ChaCha20-Poly1305 requires exactly 12 bytes
   }
 }

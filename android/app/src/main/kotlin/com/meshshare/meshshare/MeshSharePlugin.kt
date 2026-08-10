@@ -5,7 +5,10 @@ import android.bluetooth.le.*
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
+import android.util.Log
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -27,6 +30,7 @@ import java.util.UUID
 class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
 
     companion object {
+        private const val TAG = "MeshSharePlugin"
         const val METHOD_CHANNEL = "com.meshshare/mesh_service"
         const val EVENT_CHANNEL  = "com.meshshare/incoming_chunks"
 
@@ -42,6 +46,7 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
     private lateinit var eventChannel: EventChannel
 
     private var eventSink: EventChannel.EventSink? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private var bluetoothManager: BluetoothManager? = null
     private var bluetoothAdapter: BluetoothAdapter? = null
@@ -51,6 +56,8 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
 
     // Characteristics stored so we can notify connected Centrals.
     private var txCharacteristic: BluetoothGattCharacteristic? = null
+    private var identityCharacteristic: BluetoothGattCharacteristic? = null
+    private var localIdentity: ByteArray? = null
 
     // ── FlutterPlugin lifecycle ───────────────────────────────────────────────
 
@@ -77,6 +84,12 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
         methodChannel.setMethodCallHandler(null)
         stopGattServer()
         stopAdvertising()
+    }
+
+    private fun sendEvent(event: Map<String, Any>) {
+        mainHandler.post {
+            eventSink?.success(event)
+        }
     }
 
     // ── MethodCallHandler ────────────────────────────────────────────────────
@@ -106,16 +119,17 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
             }
             "refreshAdvertising" -> {
                 val identity = call.argument<ByteArray>("identity")
+                localIdentity = identity
+                identityCharacteristic?.value = identity
                 stopAdvertising()
                 if (identity != null) startAdvertising(identity)
                 result.success(null)
             }
-            "sendAck" -> {
-                val deviceId   = call.argument<String>("deviceId")
-                val fileId     = call.argument<String>("fileId")
-                val chunkIndex = call.argument<Int>("chunkIndex")
-                if (deviceId != null && fileId != null && chunkIndex != null) {
-                    sendNotification(deviceId, buildAckPayload(fileId, chunkIndex))
+            "sendRawNotification" -> {
+                val deviceId = call.argument<String>("deviceId")
+                val data     = call.argument<ByteArray>("data")
+                if (deviceId != null && data != null) {
+                    sendNotification(deviceId, data)
                 }
                 result.success(null)
             }
@@ -170,6 +184,8 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
             BluetoothGattCharacteristic.PERMISSION_READ or
                     BluetoothGattCharacteristic.PERMISSION_WRITE
         )
+        identityChar.value = localIdentity
+        identityCharacteristic = identityChar
 
         service.addCharacteristic(rxChar)
         service.addCharacteristic(txChar)
@@ -214,45 +230,40 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
                     val typeByte = value[0].toInt() and 0xFF
                     val payload  = value.drop(1).toByteArray()
                     when (typeByte) {
+                        0x00 -> {
+                            // Keepalive: echo back to the Central via notification.
+                            sendNotification(device.address, byteArrayOf(0x00))
+                        }
                         0xFE -> {
                             // Handshake message: [0xFE, step(1), ...bytes]
                             val step = (payload.firstOrNull()?.toInt() ?: 0) and 0xFF
                             val msgBytes = payload.drop(1).toByteArray()
-                            eventSink?.success(mapOf(
+                            Log.d(TAG, "RX handshake step=$step bytes=${msgBytes.size} from=${device.address} eventSink=${eventSink != null}")
+                            sendEvent(mapOf(
                                 "type"     to "handshake",
                                 "deviceId" to device.address,
                                 "step"     to step,
                                 "data"     to msgBytes.toList()
                             ))
                         }
-                        0xFF -> {
-                            // ACK: [0xFF, fileId(36), chunkIndex(4)]
-                            if (payload.size >= 40) {
-                                val fileId     = String(payload.sliceArray(0 until 36))
-                                val chunkIndex = ((payload[36].toInt() and 0xFF) shl 24) or
-                                                 ((payload[37].toInt() and 0xFF) shl 16) or
-                                                 ((payload[38].toInt() and 0xFF) shl 8)  or
-                                                  (payload[39].toInt() and 0xFF)
-                                eventSink?.success(mapOf(
-                                    "type"       to "ack",
-                                    "deviceId"   to device.address,
-                                    "fileId"     to fileId,
-                                    "chunkIndex" to chunkIndex
-                                ))
-                            }
-                        }
                         else -> {
-                            // Regular chunk: [0x01, ...FileChunk.toBytes()]
-                            eventSink?.success(mapOf(
-                                "type"     to "chunk",
+                            // Generic mesh packet: chunk (0x01), ack (0xFF), routed
+                            // handshake (0x02), presence announce (0x03), etc. The
+                            // full bytes (including the leading type byte) are
+                            // forwarded as-is so Dart does all classification —
+                            // new packet types never need a native code change.
+                            sendEvent(mapOf(
+                                "type"     to "packet",
                                 "deviceId" to device.address,
-                                "data"     to payload.toList()
+                                "data"     to value.toList()
                             ))
                         }
                     }
                 }
                 IDENTITY_CHAR_UUID -> {
-                    characteristic.value = value
+                    // Remote peer identity is written by the Central, but this
+                    // readable characteristic must continue exposing our local
+                    // identity so the Central does not read its own value back.
                 }
             }
         }
@@ -264,9 +275,14 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
             characteristic: BluetoothGattCharacteristic
         ) {
             // Return the current value (e.g. local identity stored by Dart call).
+            val value = if (characteristic.uuid == IDENTITY_CHAR_UUID) {
+                localIdentity
+            } else {
+                characteristic.value
+            }
             gattServer?.sendResponse(
                 device, requestId, BluetoothGatt.GATT_SUCCESS, offset,
-                characteristic.value
+                value
             )
         }
 
@@ -304,13 +320,17 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
 
+        val scanResponse = AdvertiseData.Builder()
+            .setIncludeDeviceName(true)
+            .build()
+
         advertiseCallback = object : AdvertiseCallback() {
             override fun onStartFailure(errorCode: Int) {
                 // Log failure — non-fatal, scanning peers will still find us.
             }
         }
 
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
     }
 
     private fun stopAdvertising() {
@@ -322,23 +342,20 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
 
     /** Notify a connected Central via the TX characteristic. */
     private fun sendNotification(deviceId: String, payload: ByteArray) {
-        val device = connectedCentrals[deviceId] ?: return
-        val tx = txCharacteristic ?: return
+        val type = payload.firstOrNull()?.toInt()?.and(0xFF) ?: -1
+        val device = connectedCentrals[deviceId]
+        if (device == null) {
+            Log.d(TAG, "TX notify skipped type=$type bytes=${payload.size}; device not connected: $deviceId")
+            return
+        }
+        val tx = txCharacteristic
+        if (tx == null) {
+            Log.d(TAG, "TX notify skipped type=$type bytes=${payload.size}; TX characteristic missing")
+            return
+        }
+        Log.d(TAG, "TX notify type=$type bytes=${payload.size} to=$deviceId")
         tx.value = payload
         gattServer?.notifyCharacteristicChanged(device, tx, false)
-    }
-
-    /** Build ACK payload: [0xFF, fileId(36 bytes), chunkIndex(4 bytes BE)] */
-    private fun buildAckPayload(fileId: String, chunkIndex: Int): ByteArray {
-        val buf = ByteArray(1 + 36 + 4)
-        buf[0] = 0xFF.toByte()
-        val idBytes = fileId.toByteArray(Charsets.UTF_8)
-        idBytes.copyInto(buf, 1, 0, minOf(36, idBytes.size))
-        buf[37] = ((chunkIndex shr 24) and 0xFF).toByte()
-        buf[38] = ((chunkIndex shr 16) and 0xFF).toByte()
-        buf[39] = ((chunkIndex shr 8)  and 0xFF).toByte()
-        buf[40] = (chunkIndex and 0xFF).toByte()
-        return buf
     }
 
     /** Build handshake payload: [0xFE, step(1 byte), ...data] */

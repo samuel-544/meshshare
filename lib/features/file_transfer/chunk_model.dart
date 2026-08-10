@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'dart:typed_data';
+
+import '../../core/utils.dart';
 
 /// Distinguishes what kind of payload is being carried in a [FileChunk].
 enum PayloadType {
@@ -26,11 +29,19 @@ enum PayloadType {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |         totalChunks (4 bytes, big-endian uint32)               |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// | type (1 byte) |  ttl (1 byte) |  dataLen (2 bytes)             |
+/// | type (1 byte) |  ttl (1 byte) | originPeerId (8 bytes)         |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |  data (dataLen bytes) + checksum (32 bytes SHA-256 plaintext)  |
+/// | destPeerId (8 bytes) | fileNameLen (2) | dataLen (2)           |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// | fileName + data (dataLen bytes) + checksum (32 bytes SHA-256)   |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
+///
+/// [originPeerId] and [destPeerId] are the true end-to-end sender/recipient
+/// identity (`MeshNode.shortId`), set once by the originating device and left
+/// untouched by every relay hop — unlike [ttl], which decrements per hop.
+/// This is what lets a multi-hop recipient look up the correct session key
+/// regardless of which relay actually delivered the packet.
 class FileChunk {
   /// Transfer session identifier (UUID v4, 36 ASCII chars).
   final String fileId;
@@ -53,6 +64,16 @@ class FileChunk {
   /// Whether this chunk carries a file or a text message.
   final PayloadType payloadType;
 
+  /// Identity ([MeshNode.shortId]) of the device that originated this
+  /// transfer — the true end-to-end sender, unchanged across relay hops.
+  final String originPeerId;
+
+  /// Identity ([MeshNode.shortId]) of the intended final recipient.
+  final String destPeerId;
+
+  /// Original file name for file payloads.
+  final String? fileName;
+
   const FileChunk({
     required this.fileId,
     required this.chunkIndex,
@@ -60,7 +81,10 @@ class FileChunk {
     required this.data,
     required this.checksum,
     required this.ttl,
+    required this.originPeerId,
+    required this.destPeerId,
     this.payloadType = PayloadType.file,
+    this.fileName,
   });
 
   /// Deduplication key used in the relay LRU cache.
@@ -76,14 +100,40 @@ class FileChunk {
       checksum: checksum,
       ttl: ttl - 1,
       payloadType: payloadType,
+      originPeerId: originPeerId,
+      destPeerId: destPeerId,
+      fileName: fileName,
     );
   }
 
   /// Serialise to bytes for BLE transmission.
   Uint8List toBytes() {
     final fileIdBytes = fileId.codeUnits;
-    // fileId(36) + chunkIndex(4) + totalChunks(4) + type(1) + ttl(1) + dataLen(2) + data + checksum(32)
-    final totalLen = 36 + 4 + 4 + 1 + 1 + 2 + data.length + 32;
+    final fileNameBytes = utf8.encode(fileName ?? '');
+    if (fileNameBytes.length > 65535) {
+      throw ArgumentError('File name is too long to serialise.');
+    }
+    final originBytes = hexToBytes(originPeerId);
+    final destBytes = hexToBytes(destPeerId);
+    if (originBytes.length != 8 || destBytes.length != 8) {
+      throw ArgumentError('originPeerId/destPeerId must be 8-byte shortIds.');
+    }
+    // fileId(36) + chunkIndex(4) + totalChunks(4) + type(1) + ttl(1)
+    // + originPeerId(8) + destPeerId(8)
+    // + fileNameLen(2) + dataLen(2) + fileName + data + checksum(32)
+    final totalLen =
+        36 +
+        4 +
+        4 +
+        1 +
+        1 +
+        8 +
+        8 +
+        2 +
+        2 +
+        fileNameBytes.length +
+        data.length +
+        32;
     final buf = ByteData(totalLen);
     int offset = 0;
 
@@ -96,10 +146,20 @@ class FileChunk {
     offset += 4;
     buf.setUint8(offset++, payloadType.wire);
     buf.setUint8(offset++, ttl);
+
+    final result = buf.buffer.asUint8List();
+    result.setRange(offset, offset + 8, originBytes);
+    offset += 8;
+    result.setRange(offset, offset + 8, destBytes);
+    offset += 8;
+
+    buf.setUint16(offset, fileNameBytes.length, Endian.big);
+    offset += 2;
     buf.setUint16(offset, data.length, Endian.big);
     offset += 2;
 
-    final result = buf.buffer.asUint8List();
+    result.setRange(offset, offset + fileNameBytes.length, fileNameBytes);
+    offset += fileNameBytes.length;
     result.setRange(offset, offset + data.length, data);
     offset += data.length;
     result.setRange(offset, offset + 32, checksum);
@@ -119,8 +179,18 @@ class FileChunk {
     offset += 4;
     final payloadType = PayloadType.fromWire(bd.getUint8(offset++));
     final ttl = bd.getUint8(offset++);
+    final originPeerId = bytesToHex(bytes.sublist(offset, offset + 8));
+    offset += 8;
+    final destPeerId = bytesToHex(bytes.sublist(offset, offset + 8));
+    offset += 8;
+    final fileNameLen = bd.getUint16(offset, Endian.big);
+    offset += 2;
     final dataLen = bd.getUint16(offset, Endian.big);
     offset += 2;
+    final fileName = fileNameLen == 0
+        ? null
+        : utf8.decode(bytes.sublist(offset, offset + fileNameLen));
+    offset += fileNameLen;
     final data = bytes.sublist(offset, offset + dataLen);
     offset += dataLen;
     final checksum = bytes.sublist(offset, offset + 32);
@@ -132,7 +202,10 @@ class FileChunk {
       data: data,
       checksum: checksum,
       ttl: ttl,
+      originPeerId: originPeerId,
+      destPeerId: destPeerId,
       payloadType: payloadType,
+      fileName: fileName,
     );
   }
 }

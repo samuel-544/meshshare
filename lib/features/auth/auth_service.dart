@@ -38,10 +38,9 @@ class AuthService extends ChangeNotifier {
     final salt = _secureRandomBytes(16);
     final hash = await _hashPin(pin, salt);
     final file = await _authFile();
-    await file.writeAsString(jsonEncode({
-      'salt': base64Encode(salt),
-      'hash': base64Encode(hash),
-    }));
+    await file.writeAsString(
+      jsonEncode({'salt': base64Encode(salt), 'hash': base64Encode(hash)}),
+    );
     _isPinSet = true;
     _isLocked = false;
     notifyListeners();

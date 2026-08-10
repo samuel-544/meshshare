@@ -6,11 +6,14 @@ import 'package:flutter/services.dart';
 
 sealed class MeshEvent {}
 
-/// A raw file/message chunk was written to our GATT RX characteristic.
-class ChunkEvent extends MeshEvent {
+/// A generic mesh packet was written to our GATT RX characteristic — the
+/// leading type byte (chunk 0x01, ack 0xFF, routed handshake 0x02, presence
+/// announce 0x03, ...) is included in [data] so [BleMeshService] can dispatch
+/// on it without needing native-side classification for every new type.
+class MeshPacketEvent extends MeshEvent {
   final String deviceId;
   final Uint8List data;
-  ChunkEvent(this.deviceId, this.data);
+  MeshPacketEvent(this.deviceId, this.data);
 }
 
 /// A Noise_XX handshake message arrived on our GATT RX characteristic.
@@ -21,22 +24,6 @@ class HandshakeEvent extends MeshEvent {
   HandshakeEvent(this.deviceId, this.step, this.data);
 }
 
-/// An ACK notification arrived on our TX characteristic (as Central).
-class AckEvent extends MeshEvent {
-  final String deviceId;
-  final String fileId;
-  final int chunkIndex;
-  AckEvent(this.deviceId, this.fileId, this.chunkIndex);
-}
-
-/// A handshake response (msg2) arrived via TX characteristic notification.
-class HandshakeResponseEvent extends MeshEvent {
-  final String deviceId;
-  final int step; // 2
-  final Uint8List data;
-  HandshakeResponseEvent(this.deviceId, this.step, this.data);
-}
-
 // ── Channel ────────────────────────────────────────────────────────────────
 
 /// Dart-side bridge to the native Android [MeshSharePlugin].
@@ -44,11 +31,13 @@ class HandshakeResponseEvent extends MeshEvent {
 /// All events from Android arrive through a single [EventChannel] as typed
 /// [MeshEvent] objects. Commands to Android go through [MethodChannel] calls.
 class MeshPlatformChannel {
-  static const MethodChannel _method =
-      MethodChannel('com.meshshare/mesh_service');
+  static const MethodChannel _method = MethodChannel(
+    'com.meshshare/mesh_service',
+  );
 
-  static const EventChannel _event =
-      EventChannel('com.meshshare/incoming_chunks');
+  static const EventChannel _event = EventChannel(
+    'com.meshshare/incoming_chunks',
+  );
 
   // Decoded typed event stream (broadcast so multiple listeners are fine).
   late final Stream<MeshEvent> _events = _event
@@ -61,17 +50,11 @@ class MeshPlatformChannel {
   Stream<MeshEvent> get events => _events;
 
   // Convenience filtered views.
-  Stream<ChunkEvent> get incomingChunks =>
-      _events.where((e) => e is ChunkEvent).cast<ChunkEvent>();
+  Stream<MeshPacketEvent> get incomingPackets =>
+      _events.where((e) => e is MeshPacketEvent).cast<MeshPacketEvent>();
 
   Stream<HandshakeEvent> get incomingHandshakeMessages =>
       _events.where((e) => e is HandshakeEvent).cast<HandshakeEvent>();
-
-  Stream<AckEvent> get incomingAcks =>
-      _events.where((e) => e is AckEvent).cast<AckEvent>();
-
-  Stream<HandshakeResponseEvent> get handshakeResponses =>
-      _events.where((e) => e is HandshakeResponseEvent).cast<HandshakeResponseEvent>();
 
   // ── Foreground service ──────────────────────────────────────────────────
 
@@ -83,11 +66,9 @@ class MeshPlatformChannel {
 
   // ── GATT server ─────────────────────────────────────────────────────────
 
-  Future<void> startGattServer() =>
-      _method.invokeMethod('startGattServer');
+  Future<void> startGattServer() => _method.invokeMethod('startGattServer');
 
-  Future<void> stopGattServer() =>
-      _method.invokeMethod('stopGattServer');
+  Future<void> stopGattServer() => _method.invokeMethod('stopGattServer');
 
   // ── Advertising ─────────────────────────────────────────────────────────
 
@@ -96,26 +77,25 @@ class MeshPlatformChannel {
 
   // ── Chunk sending (Central → Peripheral) ────────────────────────────────
 
-  // Chunks are sent directly via flutter_blue_plus in BleMeshService.
-  // No method channel call needed.
+  // Direct GATT writes are sent via flutter_blue_plus in BleMeshService.
+  // No method channel call needed for that direction.
 
-  // ── ACK sending (Peripheral → Central notification) ─────────────────────
+  // ── Generic notification (Peripheral → connected Central) ───────────────
 
-  /// Notify a connected Central that we received their chunk.
+  /// Notify a connected Central with an arbitrary mesh packet ([data]
+  /// includes the leading type byte).
   ///
-  /// Called by the receiver side (Peripheral / GATT server) after successfully
-  /// decrypting and storing a chunk. The Central's TX-characteristic listener
-  /// picks this up and marks the chunk as ACKed.
-  Future<void> sendAckToDevice({
+  /// This is how a device relays or originates traffic (chunks, ACKs, routed
+  /// handshake envelopes, presence announces) over a link where it is the
+  /// Peripheral side — the only outbound mechanism available on that side of
+  /// a GATT connection is a characteristic notification.
+  Future<void> sendRawNotification({
     required String deviceId,
-    required String fileId,
-    required int chunkIndex,
-  }) =>
-      _method.invokeMethod('sendAck', {
-        'deviceId': deviceId,
-        'fileId': fileId,
-        'chunkIndex': chunkIndex,
-      });
+    required Uint8List data,
+  }) => _method.invokeMethod('sendRawNotification', {
+    'deviceId': deviceId,
+    'data': data,
+  });
 
   // ── Handshake messaging (Peripheral → Central notification) ─────────────
 
@@ -126,12 +106,11 @@ class MeshPlatformChannel {
     required String deviceId,
     required int step,
     required Uint8List data,
-  }) =>
-      _method.invokeMethod('sendHandshakeMessage', {
-        'deviceId': deviceId,
-        'step': step,
-        'data': data,
-      });
+  }) => _method.invokeMethod('sendHandshakeMessage', {
+    'deviceId': deviceId,
+    'step': step,
+    'data': data,
+  });
 
   // ── Event decoding ───────────────────────────────────────────────────────
 
@@ -141,28 +120,14 @@ class MeshPlatformChannel {
     final type = map['type'] as String?;
 
     switch (type) {
-      case 'chunk':
-        return ChunkEvent(
+      case 'packet':
+        return MeshPacketEvent(
           map['deviceId'] as String,
           Uint8List.fromList(List<int>.from(map['data'] as List)),
         );
 
       case 'handshake':
         return HandshakeEvent(
-          map['deviceId'] as String,
-          map['step'] as int,
-          Uint8List.fromList(List<int>.from(map['data'] as List)),
-        );
-
-      case 'ack':
-        return AckEvent(
-          map['deviceId'] as String,
-          map['fileId'] as String,
-          map['chunkIndex'] as int,
-        );
-
-      case 'handshakeResponse':
-        return HandshakeResponseEvent(
           map['deviceId'] as String,
           map['step'] as int,
           Uint8List.fromList(List<int>.from(map['data'] as List)),

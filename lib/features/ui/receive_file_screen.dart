@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 
 import '../file_transfer/chunk_model.dart';
@@ -29,13 +31,19 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen> {
 
   void _subscribe() {
     final tm = context.read<TransferManager>();
+    setState(() {
+      _completedFiles
+        ..clear()
+        ..addAll(tm.receivedFiles);
+    });
 
     _progressSub = tm.progress.listen((p) {
       if (!mounted) return;
       if (p.type != PayloadType.file) return;
       setState(() {
-        final idx =
-            _activeTransfers.indexWhere((t) => t.transferId == p.transferId);
+        final idx = _activeTransfers.indexWhere(
+          (t) => t.transferId == p.transferId,
+        );
         if (p.status == TransferStatus.receiving) {
           if (idx >= 0) {
             _activeTransfers[idx] = p;
@@ -76,6 +84,56 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen> {
         '${dt.minute.toString().padLeft(2, '0')}';
   }
 
+  bool _isImageFile(String path) {
+    const imageExtensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'};
+    return imageExtensions.contains(p.extension(path).toLowerCase());
+  }
+
+  void _showFilePreview(SavedFile file) {
+    if (!_isImageFile(file.path)) return;
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        final size = MediaQuery.sizeOf(context);
+        return Dialog(
+          insetPadding: const EdgeInsets.all(16),
+          clipBehavior: Clip.antiAlias,
+          child: SizedBox(
+            width: size.width,
+            height: size.height * 0.75,
+            child: Column(
+              children: [
+                AppBar(
+                  title: Text(file.name, overflow: TextOverflow.ellipsis),
+                  automaticallyImplyLeading: false,
+                  actions: [
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+                Expanded(
+                  child: InteractiveViewer(
+                    child: Image.file(
+                      File(file.path),
+                      fit: BoxFit.contain,
+                      errorBuilder: (context, error, stackTrace) =>
+                          const Padding(
+                            padding: EdgeInsets.all(24),
+                            child: Text('Image preview failed.'),
+                          ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -87,8 +145,10 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen> {
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
-                child: Text('Incoming',
-                    style: Theme.of(context).textTheme.titleSmall),
+                child: Text(
+                  'Incoming',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
               ),
             ),
             SliverPadding(
@@ -106,8 +166,10 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen> {
           SliverToBoxAdapter(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
-              child: Text('Received',
-                  style: Theme.of(context).textTheme.titleSmall),
+              child: Text(
+                'Received',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
             ),
           ),
           // Completed files list or empty state
@@ -121,21 +183,19 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen> {
                         Icon(
                           Icons.inbox_outlined,
                           size: 64,
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onSurface
-                              .withAlpha(77),
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.onSurface.withAlpha(77),
                         ),
                         const SizedBox(height: 12),
                         Text(
                           'No files received yet',
-                          style:
-                              Theme.of(context).textTheme.bodyLarge?.copyWith(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .onSurface
-                                        .withAlpha(128),
-                                  ),
+                          style: Theme.of(context).textTheme.bodyLarge
+                              ?.copyWith(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurface.withAlpha(128),
+                              ),
                         ),
                       ],
                     ),
@@ -144,27 +204,40 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen> {
               : SliverPadding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   sliver: SliverList(
-                    delegate: SliverChildBuilderDelegate(
-                      (_, i) {
-                        final f = _completedFiles[i];
-                        return Card(
-                          child: ListTile(
-                            leading:
-                                const Icon(Icons.insert_drive_file_outlined),
-                            title: Text(f.name),
-                            subtitle: Text(
-                              '${_formatBytes(f.sizeBytes)} · '
-                              'from ${f.senderPeerId.substring(0, 8)}',
-                            ),
-                            trailing: Text(
-                              _formatTime(f.receivedAt),
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
+                    delegate: SliverChildBuilderDelegate((_, i) {
+                      final f = _completedFiles[i];
+                      final isImage = _isImageFile(f.path);
+                      return Card(
+                        child: ListTile(
+                          leading: isImage
+                              ? ClipRRect(
+                                  borderRadius: BorderRadius.circular(6),
+                                  child: Image.file(
+                                    File(f.path),
+                                    width: 48,
+                                    height: 48,
+                                    fit: BoxFit.cover,
+                                    errorBuilder:
+                                        (context, error, stackTrace) =>
+                                            const Icon(
+                                              Icons.broken_image_outlined,
+                                            ),
+                                  ),
+                                )
+                              : const Icon(Icons.insert_drive_file_outlined),
+                          title: Text(f.name),
+                          subtitle: Text(
+                            '${_formatBytes(f.sizeBytes)} · '
+                            'from ${f.senderPeerId.substring(0, 8)}',
                           ),
-                        );
-                      },
-                      childCount: _completedFiles.length,
-                    ),
+                          trailing: Text(
+                            _formatTime(f.receivedAt),
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          onTap: isImage ? () => _showFilePreview(f) : null,
+                        ),
+                      );
+                    }, childCount: _completedFiles.length),
                   ),
                 ),
         ],

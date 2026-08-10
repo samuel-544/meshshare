@@ -64,23 +64,23 @@ class _SetupPinScreenState extends State<SetupPinScreen> {
     setState(() => _step = _Step.saving);
     await context.read<AuthService>().setPin(pin);
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const HomeScreen()),
-    );
+    Navigator.of(
+      context,
+    ).pushReplacement(MaterialPageRoute(builder: (_) => const HomeScreen()));
   }
 
   String get _title => switch (_step) {
-        _Step.entering => 'Create a PIN',
-        _Step.confirming => 'Confirm your PIN',
-        _Step.saving => 'Setting up…',
-      };
+    _Step.entering => 'Create a PIN',
+    _Step.confirming => 'Confirm your PIN',
+    _Step.saving => 'Setting up…',
+  };
 
   String get _subtitle => switch (_step) {
-        _Step.entering =>
-          'Choose a 6-digit PIN to protect\nyour messages and files.',
-        _Step.confirming => 'Enter your PIN again to confirm.',
-        _Step.saving => '',
-      };
+    _Step.entering =>
+      'Choose a 6-digit PIN to protect\nyour messages and files.',
+    _Step.confirming => 'Enter your PIN again to confirm.',
+    _Step.saving => '',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -106,16 +106,16 @@ class _SetupPinScreenState extends State<SetupPinScreen> {
                   Text(
                     _title,
                     style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                          fontWeight: FontWeight.bold,
-                        ),
+                      fontWeight: FontWeight.bold,
+                    ),
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 8),
                   Text(
                     _subtitle,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: colorScheme.onSurface.withAlpha(153),
-                        ),
+                      color: colorScheme.onSurface.withAlpha(153),
+                    ),
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 28),
@@ -130,8 +130,7 @@ class _SetupPinScreenState extends State<SetupPinScreen> {
                     const SizedBox(height: 10),
                     Text(
                       _errorText!,
-                      style: TextStyle(
-                          color: colorScheme.error, fontSize: 13),
+                      style: TextStyle(color: colorScheme.error, fontSize: 13),
                       textAlign: TextAlign.center,
                     ),
                   ],
@@ -139,10 +138,7 @@ class _SetupPinScreenState extends State<SetupPinScreen> {
                   if (saving)
                     const CircularProgressIndicator()
                   else
-                    _NumberPad(
-                      onDigit: _onDigit,
-                      onDelete: _onDelete,
-                    ),
+                    _NumberPad(onDigit: _onDigit, onDelete: _onDelete),
                 ],
               ),
             ),
@@ -186,8 +182,9 @@ class _LockScreenState extends State<LockScreen> {
   }
 
   Future<void> _tryBiometric() async {
-    final success =
-        await context.read<AuthService>().authenticateWithBiometric();
+    final success = await context
+        .read<AuthService>()
+        .authenticateWithBiometric();
     if (success) _unlock();
   }
 
@@ -222,9 +219,9 @@ class _LockScreenState extends State<LockScreen> {
 
   void _unlock() {
     context.read<AuthService>().unlock();
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const HomeScreen()),
-    );
+    Navigator.of(
+      context,
+    ).pushReplacement(MaterialPageRoute(builder: (_) => const HomeScreen()));
   }
 
   @override
@@ -249,10 +246,9 @@ class _LockScreenState extends State<LockScreen> {
                   const SizedBox(height: 20),
                   Text(
                     'MeshShare is locked',
-                    style:
-                        Theme.of(context).textTheme.headlineSmall?.copyWith(
-                              fontWeight: FontWeight.bold,
-                            ),
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 8),
@@ -261,8 +257,8 @@ class _LockScreenState extends State<LockScreen> {
                         ? 'Use biometrics or enter your PIN.'
                         : 'Enter your PIN to continue.',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: colorScheme.onSurface.withAlpha(153),
-                        ),
+                      color: colorScheme.onSurface.withAlpha(153),
+                    ),
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 28),
@@ -277,8 +273,7 @@ class _LockScreenState extends State<LockScreen> {
                     const SizedBox(height: 10),
                     Text(
                       _errorText!,
-                      style: TextStyle(
-                          color: colorScheme.error, fontSize: 13),
+                      style: TextStyle(color: colorScheme.error, fontSize: 13),
                       textAlign: TextAlign.center,
                     ),
                   ],
@@ -286,10 +281,7 @@ class _LockScreenState extends State<LockScreen> {
                   if (_checking)
                     const CircularProgressIndicator()
                   else
-                    _NumberPad(
-                      onDigit: _onDigit,
-                      onDelete: _onDelete,
-                    ),
+                    _NumberPad(onDigit: _onDigit, onDelete: _onDelete),
                   if (_biometricAvailable && !_checking) ...[
                     const SizedBox(height: 20),
                     FilledButton.tonalIcon(
@@ -315,7 +307,11 @@ class _PinDots extends StatelessWidget {
   final int total;
   final Color color;
 
-  const _PinDots({required this.filled, required this.total, required this.color});
+  const _PinDots({
+    required this.filled,
+    required this.total,
+    required this.color,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -354,15 +350,14 @@ class _NumberPad extends StatelessWidget {
     ];
 
     Widget digitButton(String label) => _PadButton(
-          onTap: () => onDigit(label),
-          child: Text(
-            label,
-            style: Theme.of(context)
-                .textTheme
-                .headlineSmall
-                ?.copyWith(fontWeight: FontWeight.w500),
-          ),
-        );
+      onTap: () => onDigit(label),
+      child: Text(
+        label,
+        style: Theme.of(
+          context,
+        ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w500),
+      ),
+    );
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -379,8 +374,10 @@ class _NumberPad extends StatelessWidget {
             digitButton('0'),
             _PadButton(
               onTap: onDelete,
-              child: Icon(Icons.backspace_outlined,
-                  color: colorScheme.onSurfaceVariant),
+              child: Icon(
+                Icons.backspace_outlined,
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),

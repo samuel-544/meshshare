@@ -7,6 +7,7 @@ import 'features/crypto/key_manager.dart';
 import 'features/file_transfer/transfer_manager.dart';
 import 'features/messaging/message_sender.dart';
 import 'features/messaging/message_store.dart';
+import 'features/peers/peer_contact_store.dart';
 import 'features/ui/home_screen.dart';
 import 'features/ui/setup_pin_screen.dart'; // exports both SetupPinScreen and LockScreen
 
@@ -17,6 +18,7 @@ class MeshShareApp extends StatelessWidget {
   final MessageStore messageStore;
   final TransferManager transferManager;
   final MessageSender messageSender;
+  final PeerContactStore peerContacts;
 
   const MeshShareApp({
     super.key,
@@ -26,6 +28,7 @@ class MeshShareApp extends StatelessWidget {
     required this.messageStore,
     required this.transferManager,
     required this.messageSender,
+    required this.peerContacts,
   });
 
   @override
@@ -36,15 +39,14 @@ class MeshShareApp extends StatelessWidget {
         Provider<KeyManager>.value(value: keyManager),
         Provider<BleMeshService>.value(value: bleService),
         ChangeNotifierProvider<MessageStore>.value(value: messageStore),
+        ChangeNotifierProvider<PeerContactStore>.value(value: peerContacts),
         Provider<TransferManager>.value(value: transferManager),
         Provider<MessageSender>.value(value: messageSender),
       ],
       child: MaterialApp(
         title: 'MeshShare',
-        theme: ThemeData(
-          colorSchemeSeed: Colors.blue,
-          useMaterial3: true,
-        ),
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true),
         home: const _AppRoot(),
       ),
     );

@@ -30,6 +30,20 @@ const int kAdvertiseRefreshMs = 60000;
 /// Maximum entries in the per-node chunk deduplication LRU cache.
 const int kDedupCacheMaxSize = 1000;
 
+// ── Multi-hop mesh routing ───────────────────────────────────────────────────
+
+/// How often each node floods a presence announcement for itself (ms).
+const int kAnnounceIntervalMs = 20000;
+
+/// Drop a gossiped (indirect) peer if it hasn't been re-announced within
+/// this many ms — roughly 2x the announce interval.
+const int kIndirectPeerExpiryMs = 45000;
+
+/// How long to wait for a routed (multi-hop) handshake response before
+/// giving up. Longer than the direct handshake timeout to allow for flood
+/// propagation across several hops.
+const int kRoutedHandshakeTimeoutMs = 12000;
+
 // ── File Transfer ─────────────────────────────────────────────────────────────
 
 /// Maximum file size supported in the MVP (50 MB).

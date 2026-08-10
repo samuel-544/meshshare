@@ -41,14 +41,16 @@ class _NoiseState {
   static const String _protocolName = 'Noise_XX_25519_ChaChaPoly_SHA256';
 
   static final _sha256 = Sha256();
-  static final _hmac   = Hmac(Sha256());
-  static final _aead   = Chacha20.poly1305Aead();
+  static final _hmac = Hmac(Sha256());
+  static final _aead = Chacha20.poly1305Aead();
   static final _x25519 = X25519();
 
-  late Uint8List _h;   // handshake hash (32 bytes) — MixHash accumulates into this
-  late Uint8List _ck;  // chaining key (32 bytes) — MixKey derives new keys from this
-  SecretKey? _k;       // current symmetric key — null until first MixKey call
-  int _n = 0;          // nonce counter for AEAD during handshake
+  late Uint8List
+  _h; // handshake hash (32 bytes) — MixHash accumulates into this
+  late Uint8List
+  _ck; // chaining key (32 bytes) — MixKey derives new keys from this
+  SecretKey? _k; // current symmetric key — null until first MixKey call
+  int _n = 0; // nonce counter for AEAD during handshake
 
   // ── Initialise ─────────────────────────────────────────────────────────────
 
@@ -58,7 +60,7 @@ class _NoiseState {
     // → h = SHA-256(protocol_name)
     final nameBytes = utf8.encode(_protocolName);
     final hash = await _sha256.hash(nameBytes);
-    _h  = Uint8List.fromList(hash.bytes);
+    _h = Uint8List.fromList(hash.bytes);
     _ck = Uint8List.fromList(hash.bytes); // ck starts equal to h
   }
 
@@ -83,18 +85,20 @@ class _NoiseState {
     );
     final tempKey = Uint8List.fromList(tempKeyMac.bytes);
 
-    final ck1Mac = await _hmac.calculateMac([0x01], secretKey: SecretKey(tempKey));
-    final newCk  = Uint8List.fromList(ck1Mac.bytes);
+    final ck1Mac = await _hmac.calculateMac([
+      0x01,
+    ], secretKey: SecretKey(tempKey));
+    final newCk = Uint8List.fromList(ck1Mac.bytes);
 
-    final k2Mac = await _hmac.calculateMac(
-      [...newCk, 0x02],
-      secretKey: SecretKey(tempKey),
-    );
+    final k2Mac = await _hmac.calculateMac([
+      ...newCk,
+      0x02,
+    ], secretKey: SecretKey(tempKey));
     final newK = Uint8List.fromList(k2Mac.bytes);
 
     _ck = newCk;
-    _k  = SecretKey(newK);
-    _n  = 0; // reset nonce counter after each key rotation
+    _k = SecretKey(newK);
+    _n = 0; // reset nonce counter after each key rotation
   }
 
   /// Encrypt [plaintext] and update h.
@@ -132,7 +136,7 @@ class _NoiseState {
       return Uint8List.fromList(ciphertext);
     }
 
-    final ct      = ciphertext.sublist(0, ciphertext.length - 16);
+    final ct = ciphertext.sublist(0, ciphertext.length - 16);
     final macBytes = ciphertext.sublist(ciphertext.length - 16);
     final box = SecretBox(ct, nonce: _noiseNonce(_n++), mac: Mac(macBytes));
 
@@ -149,13 +153,18 @@ class _NoiseState {
   ///   k2       = HMAC-SHA256(temp_key, k1 || 0x02) — responder → initiator
   Future<(SecretKey, SecretKey)> split() async {
     final tempKeyMac = await _hmac.calculateMac([], secretKey: SecretKey(_ck));
-    final tempKey    = Uint8List.fromList(tempKeyMac.bytes);
+    final tempKey = Uint8List.fromList(tempKeyMac.bytes);
 
-    final k1Mac = await _hmac.calculateMac([0x01], secretKey: SecretKey(tempKey));
-    final k1    = Uint8List.fromList(k1Mac.bytes);
+    final k1Mac = await _hmac.calculateMac([
+      0x01,
+    ], secretKey: SecretKey(tempKey));
+    final k1 = Uint8List.fromList(k1Mac.bytes);
 
-    final k2Mac = await _hmac.calculateMac([...k1, 0x02], secretKey: SecretKey(tempKey));
-    final k2    = Uint8List.fromList(k2Mac.bytes);
+    final k2Mac = await _hmac.calculateMac([
+      ...k1,
+      0x02,
+    ], secretKey: SecretKey(tempKey));
+    final k2 = Uint8List.fromList(k2Mac.bytes);
 
     return (SecretKey(k1.toList()), SecretKey(k2.toList()));
   }
@@ -163,7 +172,10 @@ class _NoiseState {
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   /// Perform a Curve25519 DH and return the 32-byte shared secret.
-  Future<Uint8List> dh(SimpleKeyPairData keyPair, SimplePublicKey remotePublic) async {
+  Future<Uint8List> dh(
+    SimpleKeyPairData keyPair,
+    SimplePublicKey remotePublic,
+  ) async {
     final shared = await _x25519.sharedSecretKey(
       keyPair: keyPair,
       remotePublicKey: remotePublic,
@@ -174,9 +186,18 @@ class _NoiseState {
   /// Build the 12-byte Noise nonce: 4 zero bytes || 8-byte little-endian n.
   static List<int> _noiseNonce(int n) {
     return [
-      0, 0, 0, 0,
-      n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff,
-      0, 0, 0, 0,
+      0,
+      0,
+      0,
+      0,
+      n & 0xff,
+      (n >> 8) & 0xff,
+      (n >> 16) & 0xff,
+      (n >> 24) & 0xff,
+      0,
+      0,
+      0,
+      0,
     ];
   }
 }
@@ -193,8 +214,8 @@ class _NoiseState {
 /// ```
 class NoiseInitiator {
   final _NoiseState _state = _NoiseState();
-  final SimpleKeyPairData _s;   // local static keypair
-  late SimpleKeyPairData _e;    // local ephemeral keypair
+  final SimpleKeyPairData _s; // local static keypair
+  late SimpleKeyPairData _e; // local ephemeral keypair
   HandshakeResult? _result;
 
   NoiseInitiator._(this._s);
@@ -203,8 +224,7 @@ class NoiseInitiator {
   static Future<NoiseInitiator> create(SimpleKeyPairData staticKeyPair) async {
     final i = NoiseInitiator._(staticKeyPair);
     await i._state.init();
-    i._e = await _NoiseState._x25519.newKeyPair()
-        .then((kp) => kp.extract());
+    i._e = await _NoiseState._x25519.newKeyPair().then((kp) => kp.extract());
     return i;
   }
 
@@ -264,7 +284,7 @@ class NoiseInitiator {
     // ── Derive transport keys ─────────────────────────────────────────────────
     final (k1, k2) = await _state.split();
     _result = HandshakeResult(
-      sendKey: k1,    // initiator → responder
+      sendKey: k1, // initiator → responder
       receiveKey: k2, // responder → initiator
       remoteStaticPublicKey: rsPub,
     );
@@ -301,8 +321,7 @@ class NoiseResponder {
   static Future<NoiseResponder> create(SimpleKeyPairData staticKeyPair) async {
     final r = NoiseResponder._(staticKeyPair);
     await r._state.init();
-    r._e = await _NoiseState._x25519.newKeyPair()
-        .then((kp) => kp.extract());
+    r._e = await _NoiseState._x25519.newKeyPair().then((kp) => kp.extract());
     return r;
   }
 
@@ -366,7 +385,7 @@ class NoiseResponder {
     // ── Derive transport keys ─────────────────────────────────────────────────
     final (k1, k2) = await _state.split();
     _result = HandshakeResult(
-      sendKey: k2,    // responder → initiator (k2 is the responder send key)
+      sendKey: k2, // responder → initiator (k2 is the responder send key)
       receiveKey: k1, // initiator → responder (k1 is initiator's send key)
       remoteStaticPublicKey: risPub,
     );

@@ -36,12 +36,13 @@ class TransferProgressWidget extends StatelessWidget {
             ClipRRect(
               borderRadius: BorderRadius.circular(4),
               child: LinearProgressIndicator(
-                value: (status == TransferStatus.sending ||
+                value:
+                    (status == TransferStatus.sending ||
                         status == TransferStatus.receiving)
                     ? progress.progress
                     : status == TransferStatus.complete
-                        ? 1.0
-                        : 0.0,
+                    ? 1.0
+                    : 0.0,
                 minHeight: 8,
                 backgroundColor: colorScheme.surfaceContainerHighest,
                 color: status == TransferStatus.failed
@@ -91,8 +92,11 @@ class _StatusIcon extends StatelessWidget {
           child: CircularProgressIndicator(strokeWidth: 2),
         );
       case TransferStatus.complete:
-        return Icon(Icons.check_circle_outline,
-            color: colorScheme.primary, size: 20);
+        return Icon(
+          Icons.check_circle_outline,
+          color: colorScheme.primary,
+          size: 20,
+        );
       case TransferStatus.failed:
         return Icon(Icons.error_outline, color: colorScheme.error, size: 20);
     }

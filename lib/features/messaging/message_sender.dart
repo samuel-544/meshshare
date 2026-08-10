@@ -20,9 +20,9 @@ class MessageSender {
     required TransferManager transferManager,
     required MessageStore store,
     required String localPeerId,
-  })  : _transferManager = transferManager,
-        _store = store,
-        _localPeerId = localPeerId;
+  }) : _transferManager = transferManager,
+       _store = store,
+       _localPeerId = localPeerId;
 
   /// Send [content] to [target].
   ///

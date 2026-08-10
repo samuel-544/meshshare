@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:developer' as developer;
+import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../../core/constants.dart';
@@ -8,8 +11,166 @@ import '../../core/utils.dart';
 import '../crypto/key_manager.dart';
 import '../crypto/noise_handshake.dart';
 import '../file_transfer/chunk_model.dart';
+import '../peers/peer_contact_store.dart';
 import 'mesh_node.dart';
 import 'platform_channel.dart';
+
+enum TxNotificationType { empty, keepalive, meshPacket, handshakeResponse, unknown }
+
+@visibleForTesting
+TxNotificationType classifyTxNotification(List<int> bytes) {
+  if (bytes.isEmpty) return TxNotificationType.empty;
+
+  final type = bytes[0] & 0xff;
+  if (type == 0x00) return TxNotificationType.keepalive;
+  if (type == 0xFE && bytes.length >= 2) {
+    return TxNotificationType.handshakeResponse;
+  }
+  // Chunk (0x01), ACK (0xFF), routed handshake (0x02), presence announce
+  // (0x03) — all dispatched uniformly by BleMeshService regardless of
+  // whether they arrived via RX-write or TX-notify.
+  if (type == 0x01 || type == 0x02 || type == 0x03 || type == 0xFF) {
+    return TxNotificationType.meshPacket;
+  }
+  return TxNotificationType.unknown;
+}
+
+// ── Mesh packet wire formats ────────────────────────────────────────────────
+//
+// Pure encode/decode for the flooded packet types — no instance state, so
+// they're plain top-level functions (matching classifyTxNotification above)
+// and can be exercised directly in unit tests without any BLE transport.
+
+/// ACK packet: `[0xFF][ttl(1)][destPeerId(8)][srcPeerId(8)][fileId(36)][chunkIndex(4 BE)]`.
+/// [destPeerId] is who to route the ACK back to (the original chunk sender).
+@visibleForTesting
+Uint8List buildAckPacket({
+  required int ttl,
+  required String destPeerId,
+  required String srcPeerId,
+  required String fileId,
+  required int chunkIndex,
+}) {
+  final buf = ByteData(1 + 1 + 8 + 8 + 36 + 4);
+  int offset = 0;
+  buf.setUint8(offset++, 0xFF);
+  buf.setUint8(offset++, ttl);
+  final result = buf.buffer.asUint8List();
+  result.setRange(offset, offset + 8, hexToBytes(destPeerId));
+  offset += 8;
+  result.setRange(offset, offset + 8, hexToBytes(srcPeerId));
+  offset += 8;
+  result.setRange(offset, offset + 36, fileId.codeUnits);
+  offset += 36;
+  buf.setUint32(offset, chunkIndex, Endian.big);
+  return result;
+}
+
+/// Parses a payload built by [buildAckPacket] (type byte already stripped).
+/// Returns null if [payload] is too short to be a valid ACK.
+@visibleForTesting
+({int ttl, String destPeerId, String srcPeerId, String fileId, int chunkIndex})?
+parseAckPacket(Uint8List payload) {
+  if (payload.length < 57) return null; // ttl(1)+dest(8)+src(8)+fileId(36)+idx(4)
+  final ttl = payload[0];
+  final destPeerId = bytesToHex(payload.sublist(1, 9));
+  final srcPeerId = bytesToHex(payload.sublist(9, 17));
+  final fileId = String.fromCharCodes(payload.sublist(17, 53));
+  final bd = ByteData.sublistView(payload);
+  final chunkIndex = bd.getUint32(53, Endian.big);
+  return (
+    ttl: ttl,
+    destPeerId: destPeerId,
+    srcPeerId: srcPeerId,
+    fileId: fileId,
+    chunkIndex: chunkIndex,
+  );
+}
+
+/// Routed (multi-hop) Noise handshake envelope:
+/// `[0x02][ttl(1)][step(1)][srcPeerId(8)][dstPeerId(8)][nonce(4 BE)][msgLen(2 BE)][msg]`.
+@visibleForTesting
+Uint8List buildRoutedHandshakePacket({
+  required int ttl,
+  required int step,
+  required String srcPeerId,
+  required String dstPeerId,
+  required int nonce,
+  required Uint8List msg,
+}) {
+  final buf = ByteData(1 + 1 + 1 + 8 + 8 + 4 + 2 + msg.length);
+  int offset = 0;
+  buf.setUint8(offset++, 0x02);
+  buf.setUint8(offset++, ttl);
+  buf.setUint8(offset++, step);
+  final result = buf.buffer.asUint8List();
+  result.setRange(offset, offset + 8, hexToBytes(srcPeerId));
+  offset += 8;
+  result.setRange(offset, offset + 8, hexToBytes(dstPeerId));
+  offset += 8;
+  buf.setUint32(offset, nonce, Endian.big);
+  offset += 4;
+  buf.setUint16(offset, msg.length, Endian.big);
+  offset += 2;
+  result.setRange(offset, offset + msg.length, msg);
+  return result;
+}
+
+/// Parses a payload built by [buildRoutedHandshakePacket] (type byte already
+/// stripped). Returns null if [payload] is too short or truncated.
+@visibleForTesting
+({int ttl, int step, String srcPeerId, String dstPeerId, int nonce, Uint8List msg})?
+parseRoutedHandshakePacket(Uint8List payload) {
+  // ttl(1) + step(1) + srcPeerId(8) + dstPeerId(8) + nonce(4) + msgLen(2)
+  if (payload.length < 24) return null;
+  final ttl = payload[0];
+  final step = payload[1];
+  final srcPeerId = bytesToHex(payload.sublist(2, 10));
+  final dstPeerId = bytesToHex(payload.sublist(10, 18));
+  final bd = ByteData.sublistView(payload);
+  final nonce = bd.getUint32(18, Endian.big);
+  final msgLen = bd.getUint16(22, Endian.big);
+  if (payload.length < 24 + msgLen) return null;
+  final msg = payload.sublist(24, 24 + msgLen);
+  return (
+    ttl: ttl,
+    step: step,
+    srcPeerId: srcPeerId,
+    dstPeerId: dstPeerId,
+    nonce: nonce,
+    msg: msg,
+  );
+}
+
+/// Presence announce packet: `[0x03][ttl(1)][peerId(8)][nonce(4 BE)]`.
+@visibleForTesting
+Uint8List buildAnnouncePacket({
+  required int ttl,
+  required String peerId,
+  required int nonce,
+}) {
+  final buf = ByteData(1 + 1 + 8 + 4);
+  int offset = 0;
+  buf.setUint8(offset++, 0x03);
+  buf.setUint8(offset++, ttl);
+  final result = buf.buffer.asUint8List();
+  result.setRange(offset, offset + 8, hexToBytes(peerId));
+  offset += 8;
+  buf.setUint32(offset, nonce, Endian.big);
+  return result;
+}
+
+/// Parses a payload built by [buildAnnouncePacket] (type byte already
+/// stripped). Returns null if [payload] is too short.
+@visibleForTesting
+({int ttl, String peerId, int nonce})? parseAnnouncePacket(Uint8List payload) {
+  if (payload.length < 13) return null; // ttl(1) + peerId(8) + nonce(4)
+  final ttl = payload[0];
+  final peerId = bytesToHex(payload.sublist(1, 9));
+  final bd = ByteData.sublistView(payload);
+  final nonce = bd.getUint32(9, Endian.big);
+  return (ttl: ttl, peerId: peerId, nonce: nonce);
+}
 
 /// Central BLE Mesh service — manages discovery, connections, keepalives,
 /// chunk transfer, and relay forwarding for all MeshShare peers.
@@ -18,21 +179,33 @@ import 'platform_channel.dart';
 ///   - **Central** (scanner + GATT client) via flutter_blue_plus
 ///   - **Peripheral** (advertiser + GATT server) via [MeshPlatformChannel]
 ///
+/// All mesh traffic beyond direct-neighbor link setup (chunks, ACKs, routed
+/// handshakes, presence gossip) is flooded: forwarded to every currently
+/// connected neighbor with a decrementing TTL and a dedup cache, regardless
+/// of whether this device is the Central or Peripheral side of a given link.
+/// This is what allows messages/files to cross a relay device without every
+/// pair of devices needing to be directly connected.
+///
 /// Usage:
 /// ```dart
 /// final ble = BleMeshService();
 /// await ble.start(localIdentity: myIdentityBytes);
 /// ble.discoveredPeers.listen((node) { ... });
 /// ble.incomingChunks.listen((chunk) { ... });
-/// await ble.sendChunk(chunk, targetNode);
+/// await ble.sendChunk(chunk); // chunk.destPeerId carries the routing info
 /// ```
 class BleMeshService {
   final MeshPlatformChannel _channel;
   final KeyManager _keys;
+  final PeerContactStore? _contacts;
 
-  BleMeshService({MeshPlatformChannel? channel, required KeyManager keys})
-      : _channel = channel ?? MeshPlatformChannel(),
-        _keys = keys;
+  BleMeshService({
+    MeshPlatformChannel? channel,
+    required KeyManager keys,
+    PeerContactStore? contacts,
+  }) : _channel = channel ?? MeshPlatformChannel(),
+       _keys = keys,
+       _contacts = contacts;
 
   // ── Identity ──────────────────────────────────────────────────────────────
 
@@ -40,13 +213,28 @@ class BleMeshService {
 
   // ── Stream controllers ────────────────────────────────────────────────────
 
-  final _peerController  = StreamController<MeshNode>.broadcast();
+  final _peerController = StreamController<MeshNode>.broadcast();
+  final _indirectPeerController = StreamController<MeshNode>.broadcast();
   final _chunkController = StreamController<FileChunk>.broadcast();
-  final _ackController   = StreamController<
-      ({String peerId, String fileId, int chunkIndex})>.broadcast();
+  final _discoveryLogController = StreamController<String>.broadcast();
+  final _ackController =
+      StreamController<
+        ({String peerId, String fileId, int chunkIndex})
+      >.broadcast();
 
-  /// Emits a [MeshNode] each time a new MeshShare peer is discovered.
+  /// Emits a [MeshNode] each time a new MeshShare peer becomes ready to
+  /// send/receive — whether the session was established directly or through
+  /// a routed (multi-hop) handshake over the mesh.
   Stream<MeshNode> get discoveredPeers => _peerController.stream;
+
+  /// Emits a [MeshNode] each time a peer is heard about via presence gossip
+  /// but has no session yet (`deviceId` is null). Call [requestSecureSession]
+  /// with its `shortId` to establish one; the resulting session then arrives
+  /// through [discoveredPeers] like any other peer.
+  Stream<MeshNode> get indirectPeers => _indirectPeerController.stream;
+
+  /// Emits brief user-facing discovery and handshake progress messages.
+  Stream<String> get discoveryLogs => _discoveryLogController.stream;
 
   /// Emits each encrypted [FileChunk] that arrives at this device (after dedup).
   /// [TransferManager] decrypts and reassembles these.
@@ -58,17 +246,38 @@ class BleMeshService {
 
   // ── Connection state ──────────────────────────────────────────────────────
 
-  /// deviceId → BluetoothDevice (active GATT connections).
+  /// deviceId → BluetoothDevice (active GATT connections where we are Central).
   final Map<String, BluetoothDevice> _connections = {};
 
-  /// peerId (hex identity) → MeshNode (known peers).
+  /// Devices currently going through connect/discover/handshake.
+  final Set<String> _connectingDeviceIds = {};
+
+  /// deviceId → time before which another connection attempt should be skipped.
+  final Map<String, DateTime> _connectRetryAfter = {};
+
+  /// peerId → MeshNode (known peers — direct neighbors and routed sessions).
   final Map<String, MeshNode> _peers = {};
 
-  /// deviceId → RX characteristic (we write outgoing chunks here).
+  /// deviceId → RX characteristic (we write outgoing chunks here). Only
+  /// populated for links where we are Central.
   final Map<String, BluetoothCharacteristic> _rxChars = {};
 
-  /// deviceId → TX characteristic (we subscribe for ACKs here).
+  /// deviceId → TX characteristic (we subscribe for notifications here).
   final Map<String, BluetoothCharacteristic> _txChars = {};
+
+  /// deviceId → subscriptions for TX notifications.
+  final Map<String, List<StreamSubscription<List<int>>>> _txNotificationSubs =
+      {};
+
+  /// deviceId → last TX notification key, used to ignore duplicate stream emits.
+  final Map<String, String> _lastTxNotificationKeys = {};
+
+  /// All device IDs currently reachable over a live GATT link, regardless of
+  /// which side (Central/Peripheral) we are on that link.
+  Set<String> get _allConnectedDeviceIds => {
+    ..._connections.keys,
+    ..._peers.values.map((n) => n.deviceId).whereType<String>(),
+  };
 
   // ── Keepalive ─────────────────────────────────────────────────────────────
 
@@ -80,8 +289,10 @@ class BleMeshService {
 
   // ── Relay deduplication ───────────────────────────────────────────────────
 
-  /// LRU cache of `fileId:chunkIndex` keys seen at this node.
-  /// Prevents forwarding the same chunk twice (avoids relay loops).
+  /// LRU cache of dedup keys seen at this node — covers chunks
+  /// (`fileId:chunkIndex`), ACKs, routed handshake steps, and presence
+  /// announces. Prevents re-processing/re-forwarding the same packet twice
+  /// (avoids relay loops in the flood).
   final LruCache<String> _dedupCache = LruCache(kDedupCacheMaxSize);
 
   // ── Scanning state ────────────────────────────────────────────────────────
@@ -90,12 +301,14 @@ class BleMeshService {
   DateTime? _lastNewPeerAt;
   Timer? _scanCycleTimer;
   Timer? _advertiseRefreshTimer;
+  Timer? _announceTimer;
+  Timer? _indirectExpiryTimer;
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  /// Start advertising, scanning, and the GATT server.
+  /// Start advertising and the GATT server.
   ///
   /// [localIdentity] is the 32-byte SHA-256 hash of the device's Noise
   /// static public key — used as the stable peer identity.
@@ -103,42 +316,47 @@ class BleMeshService {
     if (_running) return;
     _localIdentity = localIdentity;
     _running = true;
+    _log('MeshShare is ready for nearby peers.');
 
-    // Start Android foreground service (keeps BLE alive with screen off).
-    await _channel.startForegroundService();
+    // Foreground-service startup is intentionally disabled during foreground
+    // device testing. Recent Android versions require the connectedDevice FGS
+    // type to be started only after Bluetooth runtime permissions are fully
+    // granted; if the OS rejects it, the service crash kills the app. BLE still
+    // works while MeshShare is open, which is enough for the project demo.
 
     // Start GATT server on the Android side; incoming events are
     // forwarded to Dart via the typed event channel.
     await _channel.startGattServer();
-    _channel.incomingChunks.listen((e) => _onRawChunkReceived(e.data));
-    _channel.incomingAcks.listen((e) {
-      // Find the peer identity for this deviceId.
-      final peer = _peers.values
-          .where((n) => n.deviceId == e.deviceId)
-          .firstOrNull;
-      if (peer == null) return;
-      _ackController.add((
-        peerId: peer.shortId,
-        fileId: e.fileId,
-        chunkIndex: e.chunkIndex,
-      ));
-    });
+    _channel.incomingPackets.listen(
+      (e) => _onMeshPacket(e.deviceId, e.data),
+    );
     // Responder side: handle incoming handshake messages from Centrals.
     _channel.incomingHandshakeMessages.listen(_onIncomingHandshakeMessage);
 
     // Watch adapter state — restart scanning if BT is toggled.
     _adapterSub = FlutterBluePlus.adapterState.listen((state) {
       if (state == BluetoothAdapterState.on && _running) {
-        _startScanCycle();
+        _log('Bluetooth is on.');
         _scheduleAdvertiseRefresh();
       }
     });
 
-    if (await FlutterBluePlus.adapterState.first ==
-        BluetoothAdapterState.on) {
-      _startScanCycle();
+    _scheduleAnnounce();
+    _scheduleIndirectPeerExpiry();
+
+    if (await FlutterBluePlus.adapterState.first == BluetoothAdapterState.on) {
       _scheduleAdvertiseRefresh();
     }
+  }
+
+  /// Start an explicit user-requested discovery pass.
+  Future<void> discoverPeers() async {
+    if (!_running) {
+      _log('MeshShare is not ready yet.');
+      return;
+    }
+    _log('Scanning for nearby MeshShare devices...');
+    _startScanCycle();
   }
 
   /// Stop all BLE activity and release resources.
@@ -146,6 +364,8 @@ class BleMeshService {
     _running = false;
     _scanCycleTimer?.cancel();
     _advertiseRefreshTimer?.cancel();
+    _announceTimer?.cancel();
+    _indirectExpiryTimer?.cancel();
     _scanSub?.cancel();
     _adapterSub?.cancel();
     await FlutterBluePlus.stopScan();
@@ -154,6 +374,14 @@ class BleMeshService {
       timer.cancel();
     }
     _keepaliveTimers.clear();
+    for (final timer in _routedHandshakeTimers.values) {
+      timer.cancel();
+    }
+    _routedHandshakeTimers.clear();
+    _pendingRoutedInitiators.clear();
+    _pendingRoutedResponders.clear();
+    _routedHandshakeCompleters.clear();
+    _knownIndirectPeers.clear();
 
     for (final device in _connections.values) {
       await device.disconnect();
@@ -161,12 +389,21 @@ class BleMeshService {
     _connections.clear();
     _rxChars.clear();
     _txChars.clear();
+    for (final subs in _txNotificationSubs.values) {
+      for (final sub in subs) {
+        await sub.cancel();
+      }
+    }
+    _txNotificationSubs.clear();
+    _lastTxNotificationKeys.clear();
 
     await _channel.stopGattServer();
-    await _channel.stopForegroundService();
+    // Foreground service is not started in the current foreground-only demo.
 
     await _peerController.close();
+    await _indirectPeerController.close();
     await _chunkController.close();
+    await _discoveryLogController.close();
     await _ackController.close();
   }
 
@@ -201,6 +438,9 @@ class BleMeshService {
 
   Future<void> _doScan() async {
     if (!_running) return;
+    if (_connectingDeviceIds.isNotEmpty || _pendingInitiators.isNotEmpty) {
+      return;
+    }
     await FlutterBluePlus.stopScan();
     await _scanSub?.cancel();
 
@@ -219,9 +459,44 @@ class BleMeshService {
   void _onScanResult(ScanResult result) {
     final deviceId = result.device.remoteId.str;
     if (_connections.containsKey(deviceId)) return; // already connected
+    if (_connectingDeviceIds.contains(deviceId)) return; // already connecting
+
+    final retryAfter = _connectRetryAfter[deviceId];
+    if (retryAfter != null && DateTime.now().isBefore(retryAfter)) return;
 
     _lastNewPeerAt = DateTime.now();
-    _connectToDevice(result.device, result.rssi);
+    _log('Found a MeshShare device. Connecting...');
+    _connectingDeviceIds.add(deviceId);
+    _scanCycleTimer?.cancel();
+    unawaited(
+      _connectToDevice(result.device, result.rssi, _displayNameFor(result)),
+    );
+  }
+
+  String? _displayNameFor(ScanResult result) {
+    final names = <String?>[];
+
+    try {
+      names.add((result.device as dynamic).platformName as String?);
+    } catch (_) {}
+
+    try {
+      names.add((result.device as dynamic).name as String?);
+    } catch (_) {}
+
+    try {
+      names.add((result.advertisementData as dynamic).advName as String?);
+    } catch (_) {}
+
+    try {
+      names.add((result.advertisementData as dynamic).localName as String?);
+    } catch (_) {}
+
+    for (final name in names) {
+      final clean = name?.trim();
+      if (clean != null && clean.isNotEmpty) return clean;
+    }
+    return null;
   }
 
   // ── Advertising refresh ───────────────────────────────────────────────────
@@ -240,12 +515,20 @@ class BleMeshService {
 
   // ── GATT connection ───────────────────────────────────────────────────────
 
-  Future<void> _connectToDevice(BluetoothDevice device, int rssi) async {
+  Future<void> _connectToDevice(
+    BluetoothDevice device,
+    int rssi,
+    String? displayName,
+  ) async {
     final deviceId = device.remoteId.str;
     try {
+      _log('Opening Bluetooth connection...');
+      await FlutterBluePlus.stopScan();
       await device.connect(timeout: const Duration(seconds: 10));
       _connections[deviceId] = device;
+      _connectRetryAfter.remove(deviceId);
 
+      _log('Preparing secure transfer channel...');
       // Negotiate a larger MTU so full chunk packets fit in one write.
       // A chunk packet is ~100 bytes; request 256 to have headroom.
       await device.requestMtu(256);
@@ -260,7 +543,8 @@ class BleMeshService {
       final services = await device.discoverServices();
       final meshService = services.firstWhere(
         (s) => s.serviceUuid == Guid(kServiceUuid),
-        orElse: () => throw Exception('MeshShare service not found on $deviceId'),
+        orElse: () =>
+            throw Exception('MeshShare service not found on $deviceId'),
       );
 
       BluetoothCharacteristic? rxChar;
@@ -282,59 +566,83 @@ class BleMeshService {
       _txChars[deviceId] = txChar;
 
       // Exchange identity.
+      _log('Exchanging peer identity...');
       await identityChar.write(_localIdentity, withoutResponse: false);
       final peerIdentityBytes = await identityChar.read();
       final peerIdentity = Uint8List.fromList(peerIdentityBytes);
-      final peerId = _bytesToHex(peerIdentity);
+      final peerId = bytesToHex(peerIdentity);
 
       final node = MeshNode(
         identity: peerIdentity,
         deviceId: deviceId,
+        displayName: displayName,
         rssi: rssi,
         lastSeenMs: DateTime.now().millisecondsSinceEpoch,
       );
+      // Keep the peer internally while the handshake completes, but do not
+      // expose it to the UI until session keys are available for sending.
       _peers[peerId] = node;
-      _peerController.add(node);
 
-      // Subscribe to TX notifications: keepalive echoes, ACKs, handshake responses.
-      await txChar.setNotifyValue(true);
-      txChar.lastValueStream.listen((bytes) {
-        if (bytes.isEmpty) return;
-        final type = bytes[0] & 0xff;
-        if (type == 0x00) {
-          // Keepalive echo — reset missed counter.
-          _keepaliveMissed[peerId] = 0;
-        } else if (type == 0xFF && bytes.length >= 41) {
-          // ACK: [0xFF, fileId(36), chunkIndex(4)]
-          final fileId = String.fromCharCodes(bytes.sublist(1, 37));
-          final bd = ByteData.sublistView(Uint8List.fromList(bytes));
-          final chunkIndex = bd.getUint32(37, Endian.big);
-          _ackController.add((
-            peerId: peerId,
-            fileId: fileId,
-            chunkIndex: chunkIndex,
-          ));
-        } else if (type == 0xFE && bytes.length >= 2) {
-          // Handshake response (msg2 from responder): process as initiator.
-          final step = bytes[1] & 0xff;
-          final data = Uint8List.fromList(bytes.sublist(2));
-          _onHandshakeResponse(deviceId: deviceId, step: step, data: data);
+      // Subscribe before enabling notifications so the handshake response cannot
+      // arrive between the CCCD write and our Dart listener registration.
+      final previousSubs = _txNotificationSubs.remove(deviceId);
+      if (previousSubs != null) {
+        for (final sub in previousSubs) {
+          await sub.cancel();
         }
-      });
+      }
+      void handleTxBytes(List<int> bytes) => _onTxNotification(
+        deviceId: deviceId,
+        peerId: peerId,
+        node: node,
+        bytes: bytes,
+      );
+
+      _txNotificationSubs[deviceId] = [
+        txChar.onValueReceived.listen(handleTxBytes),
+        txChar.lastValueStream.listen(handleTxBytes),
+      ];
+      await txChar.setNotifyValue(true);
 
       // ── Noise_XX handshake (initiator side) ────────────────────────────────
+      _log('Starting secure handshake...');
       await _performHandshakeAsInitiator(
         deviceId: deviceId,
         peerId: peerId,
         rxChar: rxChar,
       );
-
-      // Start keepalive for this peer.
-      _startKeepalive(peerId, deviceId);
-    } catch (e) {
+    } catch (e, st) {
+      developer.log(
+        'Could not complete BLE discovery for $deviceId',
+        name: 'MeshShare.BLE',
+        error: e,
+        stackTrace: st,
+      );
+      _log('Could not complete discovery for one device.');
+      _connectRetryAfter[deviceId] = DateTime.now().add(
+        const Duration(seconds: 15),
+      );
       _connections.remove(deviceId);
       _rxChars.remove(deviceId);
       _txChars.remove(deviceId);
+      final subs = _txNotificationSubs.remove(deviceId);
+      if (subs != null) {
+        for (final sub in subs) {
+          await sub.cancel();
+        }
+      }
+      _lastTxNotificationKeys.remove(deviceId);
+      _peers.removeWhere((_, node) => node.deviceId == deviceId);
+      try {
+        await device.disconnect();
+      } catch (_) {
+        // Already disconnected.
+      }
+    } finally {
+      _connectingDeviceIds.remove(deviceId);
+      if (_running && _connections.isEmpty && _pendingInitiators.isEmpty) {
+        _startScanCycle();
+      }
     }
   }
 
@@ -342,6 +650,13 @@ class BleMeshService {
     _connections.remove(deviceId);
     _rxChars.remove(deviceId);
     _txChars.remove(deviceId);
+    final subs = _txNotificationSubs.remove(deviceId);
+    if (subs != null) {
+      for (final sub in subs) {
+        unawaited(sub.cancel());
+      }
+    }
+    _lastTxNotificationKeys.remove(deviceId);
 
     // Find and remove the peer entry for this device.
     _peers.removeWhere((peerId, node) {
@@ -349,6 +664,7 @@ class BleMeshService {
         _keepaliveTimers[peerId]?.cancel();
         _keepaliveTimers.remove(peerId);
         _keepaliveMissed.remove(peerId);
+        _keys.clearSession(node.shortId);
         return true;
       }
       return false;
@@ -382,44 +698,180 @@ class BleMeshService {
     );
   }
 
+  // ── Flood send ────────────────────────────────────────────────────────────
+
+  /// Send [packet] to every currently connected neighbor, regardless of
+  /// whether we are the Central or Peripheral side of that link.
+  ///
+  /// This is the single primitive behind chunk origination/relay, ACK
+  /// routing, routed handshakes, and presence gossip. Combined with a TTL
+  /// byte in every packet and the dedup cache, this is enough to deliver
+  /// traffic across multiple hops without a routing table.
+  Future<void> _floodSend(Uint8List packet, {String? excludeDeviceId}) async {
+    for (final id in _allConnectedDeviceIds) {
+      if (id == excludeDeviceId) continue;
+      try {
+        final rx = _rxChars[id];
+        if (rx != null) {
+          // We're Central on this link — write to the neighbor's RX char.
+          await rx.write(packet, withoutResponse: true);
+        } else {
+          // We're Peripheral on this link — notify via our TX char.
+          await _channel.sendRawNotification(deviceId: id, data: packet);
+        }
+      } catch (_) {
+        // Best-effort per-neighbor forward — one bad link shouldn't stop the rest.
+      }
+    }
+  }
+
   // ── Sending ───────────────────────────────────────────────────────────────
 
-  /// Write a single encrypted [chunk] to [target]'s RX characteristic.
+  /// Encrypt-and-flood [chunk] into the mesh.
   ///
-  /// Prepends type byte `0x01` so the receiver can distinguish chunks from
-  /// handshake messages and ACKs.
-  Future<void> sendChunk(FileChunk chunk, MeshNode target) async {
-    final rx = _rxChars[target.deviceId];
-    if (rx == null) {
-      throw StateError('No active connection to ${target.shortId}');
-    }
+  /// The chunk's own `originPeerId`/`destPeerId` fields carry true end-to-end
+  /// routing information, so this does not require (or use) a direct GATT
+  /// link to the final recipient — it works identically for a directly
+  /// connected peer and one several relay hops away.
+  Future<void> sendChunk(FileChunk chunk) async {
     final chunkBytes = chunk.toBytes();
     final packet = Uint8List(1 + chunkBytes.length);
     packet[0] = 0x01; // type: chunk
     packet.setAll(1, chunkBytes);
-    await rx.write(packet, withoutResponse: true);
+    await _floodSend(packet);
   }
 
-  /// Send an ACK for [chunkIndex] of transfer [fileId] back to [target].
-  ///
-  /// ACKs flow from Peripheral (receiver) back to Central (sender).
-  /// If [target] is null (peer not found), the ACK is silently dropped.
+  /// Send an ACK for [chunkIndex] of transfer [fileId], routed back to
+  /// [originPeerId] (the transfer's original sender) over the mesh.
   Future<void> sendAck({
     required String fileId,
     required int chunkIndex,
-    required MeshNode? target,
+    required String originPeerId,
   }) async {
-    if (target == null) return;
-    await _channel.sendAckToDevice(
-      deviceId: target.deviceId,
+    final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+    final packet = buildAckPacket(
+      ttl: kDefaultTtl,
+      destPeerId: originPeerId,
+      srcPeerId: myPeerId,
       fileId: fileId,
       chunkIndex: chunkIndex,
     );
+    await _floodSend(packet);
   }
 
   // ── Receiving ─────────────────────────────────────────────────────────────
 
-  // ── Noise_XX handshake (Central / initiator side) ─────────────────────────
+  void _onTxNotification({
+    required String deviceId,
+    required String peerId,
+    required MeshNode node,
+    required List<int> bytes,
+  }) {
+    if (bytes.isEmpty) return;
+    final notificationKey = bytes.join(',');
+    if (_lastTxNotificationKeys[deviceId] == notificationKey) return;
+    _lastTxNotificationKeys[deviceId] = notificationKey;
+
+    final type = bytes[0] & 0xff;
+    _log(
+      'TX notification: ${bytes.length} bytes, type 0x${type.toRadixString(16).padLeft(2, '0')}.',
+    );
+    switch (classifyTxNotification(bytes)) {
+      case TxNotificationType.empty:
+        return;
+      case TxNotificationType.keepalive:
+        // Keepalive echo — reset missed counter.
+        _keepaliveMissed[peerId] = 0;
+      case TxNotificationType.meshPacket:
+        _onMeshPacket(deviceId, Uint8List.fromList(bytes));
+      case TxNotificationType.handshakeResponse:
+        // Handshake response (msg2 from responder): process as initiator.
+        final step = bytes[1] & 0xff;
+        final data = Uint8List.fromList(bytes.sublist(2));
+        _log('Received secure handshake response.');
+        _onHandshakeResponse(deviceId: deviceId, step: step, data: data);
+      case TxNotificationType.unknown:
+        return;
+    }
+  }
+
+  /// Single dispatcher for every mesh packet, regardless of whether it
+  /// arrived via an RX-write (we're Peripheral on that link) or a TX-notify
+  /// (we're Central) — both directions must be handled identically for
+  /// relaying to work no matter which role this device has on a given link.
+  void _onMeshPacket(String deviceId, Uint8List bytes) {
+    if (bytes.isEmpty) return;
+    final payload = bytes.sublist(1);
+    switch (bytes[0] & 0xff) {
+      case 0x01:
+        _handleChunkPacket(deviceId, payload);
+      case 0xFF:
+        _handleAckPacket(payload);
+      case 0x02:
+        _handleRoutedHandshakePacket(payload);
+      case 0x03:
+        _handleAnnouncePacket(payload);
+    }
+  }
+
+  void _handleChunkPacket(String deviceId, Uint8List payload) {
+    try {
+      final chunk = FileChunk.fromBytes(payload);
+
+      // Deduplication — drop if this node has already seen this chunk.
+      if (_dedupCache.contains(chunk.dedupKey)) return;
+      _dedupCache.put(chunk.dedupKey);
+
+      // Emit to local listeners (transfer manager / message store) — they
+      // silently drop it if there's no matching session (i.e. it's not
+      // addressed to us and we're just relaying it through).
+      _chunkController.add(chunk);
+
+      // Relay onward to every other neighbor if TTL allows.
+      if (chunk.ttl > 0) {
+        final chunkBytes = chunk.decrementTtl().toBytes();
+        final packet = Uint8List(1 + chunkBytes.length);
+        packet[0] = 0x01;
+        packet.setAll(1, chunkBytes);
+        unawaited(_floodSend(packet, excludeDeviceId: deviceId));
+      }
+    } catch (_) {
+      // Malformed packet — silently drop.
+    }
+  }
+
+  Future<void> _handleAckPacket(Uint8List payload) async {
+    final parsed = parseAckPacket(payload);
+    if (parsed == null) return;
+    final (:ttl, :destPeerId, :srcPeerId, :fileId, :chunkIndex) = parsed;
+
+    final dedupKey = 'ack:$srcPeerId:$fileId:$chunkIndex';
+    if (_dedupCache.contains(dedupKey)) return;
+    _dedupCache.put(dedupKey);
+
+    final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+    if (destPeerId == myPeerId) {
+      _ackController.add((
+        peerId: srcPeerId,
+        fileId: fileId,
+        chunkIndex: chunkIndex,
+      ));
+      return;
+    }
+
+    if (ttl > 0) {
+      final relayed = buildAckPacket(
+        ttl: ttl - 1,
+        destPeerId: destPeerId,
+        srcPeerId: srcPeerId,
+        fileId: fileId,
+        chunkIndex: chunkIndex,
+      );
+      unawaited(_floodSend(relayed));
+    }
+  }
+
+  // ── Noise_XX handshake (Central / initiator side, direct neighbor) ────────
 
   // Pending initiator handshakes: deviceId → NoiseInitiator
   final Map<String, NoiseInitiator> _pendingInitiators = {};
@@ -440,7 +892,19 @@ class BleMeshService {
     packet[1] = 1;
     packet.setAll(2, msg1);
     await rxChar.write(packet, withoutResponse: false);
+    _log('Secure handshake request sent.');
+    unawaited(_failHandshakeIfNoResponse(deviceId));
     // msg2 arrives via TX notification → _onHandshakeResponse
+  }
+
+  Future<void> _failHandshakeIfNoResponse(String deviceId) async {
+    await Future<void>.delayed(const Duration(seconds: 8));
+    if (!_pendingInitiators.containsKey(deviceId)) return;
+
+    _pendingInitiators.remove(deviceId);
+    _log('Secure handshake response timed out.');
+    _peers.removeWhere((_, node) => node.deviceId == deviceId);
+    await _connections[deviceId]?.disconnect();
   }
 
   void _onHandshakeResponse({
@@ -453,6 +917,7 @@ class BleMeshService {
     if (initiator == null) return;
 
     try {
+      _log('Finishing secure handshake...');
       final msg3 = await initiator.readMsg2WriteMsg3(data);
       final result = initiator.result;
 
@@ -467,17 +932,39 @@ class BleMeshService {
       }
 
       // Find peer and store session keys.
-      final peer = _peers.values.where((n) => n.deviceId == deviceId).firstOrNull;
+      final peer = _peers.values
+          .where((n) => n.deviceId == deviceId)
+          .firstOrNull;
       if (peer != null) {
         _keys.storeSession(peer.shortId, result.sendKey, result.receiveKey);
+        await _contacts?.saveHandshakePeer(
+          peerId: peer.shortId,
+          deviceName: peer.displayName,
+        );
+        _log(
+          '${peer.displayName ?? 'Peer ${peer.shortId.substring(0, 8)}'} is ready.',
+        );
+        _peerController.add(peer);
+        _startKeepalive(bytesToHex(peer.identity), deviceId);
       }
-    } catch (_) {
+    } catch (e, st) {
+      developer.log(
+        'Secure handshake failed for $deviceId',
+        name: 'MeshShare.BLE',
+        error: e,
+        stackTrace: st,
+      );
       // Handshake failed — disconnect peer.
+      _log('Secure handshake failed.');
+      _peers.removeWhere((_, node) => node.deviceId == deviceId);
       _connections[deviceId]?.disconnect();
+      if (_running && _connections.isEmpty) {
+        _startScanCycle();
+      }
     }
   }
 
-  // ── Noise_XX handshake (Peripheral / responder side) ──────────────────────
+  // ── Noise_XX handshake (Peripheral / responder side, direct neighbor) ─────
 
   // Pending responder handshakes: deviceId → NoiseResponder
   final Map<String, NoiseResponder> _pendingResponders = {};
@@ -486,6 +973,7 @@ class BleMeshService {
     final deviceId = event.deviceId;
     if (event.step == 1) {
       // Msg1 received — create responder and send msg2 back.
+      _log('Nearby peer requested a secure handshake...');
       final keyPair = await _keys.getOrCreateStaticKeyPair();
       final responder = await NoiseResponder.create(keyPair);
       _pendingResponders[deviceId] = responder;
@@ -496,7 +984,9 @@ class BleMeshService {
           step: 2,
           data: msg2,
         );
+        _log('Handshake response sent.');
       } catch (_) {
+        _log('Could not respond to handshake.');
         _pendingResponders.remove(deviceId);
       }
     } else if (event.step == 3) {
@@ -506,56 +996,298 @@ class BleMeshService {
       try {
         await responder.readMessage3(event.data);
         final result = responder.result;
-        // Derive a stable shortId for the initiator from their static key.
+        // Match MeshNode.shortId: first 8 bytes of the 32-byte identity
+        // represented as 16 hex characters.
         final peerId = await _keys.identityFor(result.remoteStaticPublicKey);
-        _keys.storeSession(peerId.substring(0, 8), result.sendKey, result.receiveKey);
+        final shortPeerId = peerId.substring(0, 16);
+        _keys.storeSession(shortPeerId, result.sendKey, result.receiveKey);
+        _peers[peerId] = MeshNode(
+          identity: hexToBytes(peerId),
+          deviceId: deviceId,
+          rssi: 0,
+          lastSeenMs: DateTime.now().millisecondsSinceEpoch,
+        );
+        await _contacts?.saveHandshakePeer(peerId: shortPeerId);
+        _log('Secure session ready with peer ${shortPeerId.substring(0, 8)}.');
       } catch (_) {
         // Handshake failed — ignore (Central will disconnect).
+        _log('Secure handshake failed.');
       }
     }
   }
 
-  // ── Receiving ─────────────────────────────────────────────────────────────
+  // ── Routed Noise_XX handshake (multi-hop, flooded) ─────────────────────────
 
-  /// Called by the platform channel when the Android GATT server receives
-  /// raw bytes on the RX characteristic from a remote Central.
-  void _onRawChunkReceived(Uint8List bytes) {
+  // Pending routed handshakes, keyed by the remote peer's shortId.
+  final Map<String, NoiseInitiator> _pendingRoutedInitiators = {};
+  final Map<String, NoiseResponder> _pendingRoutedResponders = {};
+  final Map<String, Timer> _routedHandshakeTimers = {};
+  final Map<String, Completer<bool>> _routedHandshakeCompleters = {};
+
+  /// Establish an end-to-end Noise session with [targetPeerId] (a
+  /// [MeshNode.shortId]), even if it's not a direct neighbor — the handshake
+  /// messages are flooded through the mesh like any other packet.
+  ///
+  /// Returns true once a session is ready (also delivered through
+  /// [discoveredPeers]), or false if no response arrives within
+  /// [kRoutedHandshakeTimeoutMs].
+  Future<bool> requestSecureSession(String targetPeerId) async {
+    if (_keys.hasSession(targetPeerId)) return true;
+
+    final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+    final keyPair = await _keys.getOrCreateStaticKeyPair();
+    final initiator = await NoiseInitiator.create(keyPair);
+    _pendingRoutedInitiators[targetPeerId] = initiator;
+
+    final msg1 = await initiator.writeMessage1();
+    final packet = buildRoutedHandshakePacket(
+      ttl: kDefaultTtl,
+      step: 1,
+      srcPeerId: myPeerId,
+      dstPeerId: targetPeerId,
+      nonce: _randomNonce(),
+      msg: msg1,
+    );
+    _log('Requesting a secure session over the mesh...');
+    await _floodSend(packet);
+
+    final completer = Completer<bool>();
+    _routedHandshakeCompleters[targetPeerId] = completer;
+    _routedHandshakeTimers[targetPeerId]?.cancel();
+    _routedHandshakeTimers[targetPeerId] = Timer(
+      const Duration(milliseconds: kRoutedHandshakeTimeoutMs),
+      () {
+        if (_pendingRoutedInitiators.remove(targetPeerId) != null) {
+          _log('Secure session request timed out — peer may be out of range.');
+        }
+        _routedHandshakeCompleters.remove(targetPeerId)?.complete(false);
+      },
+    );
+    return completer.future;
+  }
+
+  Future<void> _handleRoutedHandshakePacket(Uint8List payload) async {
+    final parsed = parseRoutedHandshakePacket(payload);
+    if (parsed == null) return;
+    final (:ttl, :step, :srcPeerId, :dstPeerId, :nonce, :msg) = parsed;
+
+    final dedupKey = 'hs:$srcPeerId:$dstPeerId:$step:$nonce';
+    if (_dedupCache.contains(dedupKey)) return;
+    _dedupCache.put(dedupKey);
+
+    final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+    if (dstPeerId != myPeerId) {
+      if (ttl > 0) {
+        final relayed = buildRoutedHandshakePacket(
+          ttl: ttl - 1,
+          step: step,
+          srcPeerId: srcPeerId,
+          dstPeerId: dstPeerId,
+          nonce: nonce,
+          msg: msg,
+        );
+        unawaited(_floodSend(relayed));
+      }
+      return;
+    }
+
+    switch (step) {
+      case 1:
+        await _onRoutedHandshakeStep1(fromPeerId: srcPeerId, msg1: msg);
+      case 2:
+        await _onRoutedHandshakeStep2(fromPeerId: srcPeerId, msg2: msg);
+      case 3:
+        await _onRoutedHandshakeStep3(fromPeerId: srcPeerId, msg3: msg);
+    }
+  }
+
+  Future<void> _onRoutedHandshakeStep1({
+    required String fromPeerId,
+    required Uint8List msg1,
+  }) async {
     try {
-      final chunk = FileChunk.fromBytes(bytes);
+      final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+      final keyPair = await _keys.getOrCreateStaticKeyPair();
+      final responder = await NoiseResponder.create(keyPair);
+      final msg2 = await responder.readMsg1WriteMsg2(msg1);
+      _pendingRoutedResponders[fromPeerId] = responder;
 
-      // Deduplication — drop if this node has already seen this chunk.
-      if (_dedupCache.contains(chunk.dedupKey)) return;
-      _dedupCache.put(chunk.dedupKey);
-
-      // Emit to local listeners (transfer manager / message store).
-      _chunkController.add(chunk);
-
-      // Relay: forward to all other connected peers if TTL allows.
-      if (chunk.ttl > 0) {
-        _relayChunk(chunk.decrementTtl());
-      }
+      final packet = buildRoutedHandshakePacket(
+        ttl: kDefaultTtl,
+        step: 2,
+        srcPeerId: myPeerId,
+        dstPeerId: fromPeerId,
+        nonce: _randomNonce(),
+        msg: msg2,
+      );
+      _log('Responding to a mesh secure-session request...');
+      await _floodSend(packet);
     } catch (_) {
-      // Malformed packet — silently drop.
+      // Malformed or replayed handshake attempt — ignore.
     }
   }
 
-  Future<void> _relayChunk(FileChunk chunk) async {
-    for (final entry in _peers.entries) {
-      final peer = entry.value;
-      final rx = _rxChars[peer.deviceId];
-      if (rx == null) continue;
-      try {
-        await rx.write(chunk.toBytes(), withoutResponse: true);
-      } catch (_) {
-        // Best-effort relay — ignore per-peer failures.
-      }
+  Future<void> _onRoutedHandshakeStep2({
+    required String fromPeerId,
+    required Uint8List msg2,
+  }) async {
+    final initiator = _pendingRoutedInitiators.remove(fromPeerId);
+    if (initiator == null) return;
+
+    var success = false;
+    try {
+      final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+      final msg3 = await initiator.readMsg2WriteMsg3(msg2);
+      final result = initiator.result;
+
+      final packet = buildRoutedHandshakePacket(
+        ttl: kDefaultTtl,
+        step: 3,
+        srcPeerId: myPeerId,
+        dstPeerId: fromPeerId,
+        nonce: _randomNonce(),
+        msg: msg3,
+      );
+      await _floodSend(packet);
+
+      success = await _finishRoutedSession(peerId: fromPeerId, result: result);
+    } catch (_) {
+      _log('Secure session over the mesh failed.');
+    } finally {
+      _routedHandshakeTimers.remove(fromPeerId)?.cancel();
+      _routedHandshakeCompleters.remove(fromPeerId)?.complete(success);
     }
   }
+
+  Future<void> _onRoutedHandshakeStep3({
+    required String fromPeerId,
+    required Uint8List msg3,
+  }) async {
+    final responder = _pendingRoutedResponders.remove(fromPeerId);
+    if (responder == null) return;
+
+    try {
+      await responder.readMessage3(msg3);
+      await _finishRoutedSession(peerId: fromPeerId, result: responder.result);
+    } catch (_) {
+      _log('Secure session over the mesh failed.');
+    }
+  }
+
+  Future<bool> _finishRoutedSession({
+    required String peerId,
+    required HandshakeResult result,
+  }) async {
+    final fullIdentityHex = await _keys.identityFor(
+      result.remoteStaticPublicKey,
+    );
+    _keys.storeSession(peerId, result.sendKey, result.receiveKey);
+    final node = MeshNode(
+      identity: hexToBytes(fullIdentityHex),
+      rssi: 0,
+      lastSeenMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    _peers[fullIdentityHex] = node;
+    _knownIndirectPeers.remove(peerId);
+    await _contacts?.saveHandshakePeer(peerId: peerId);
+    _log('Secure session ready over the mesh.');
+    _peerController.add(node);
+    return true;
+  }
+
+  // ── Presence gossip (multi-hop peer discovery, flooded) ────────────────────
+
+  /// peerId → last time we heard a presence announce for it.
+  final Map<String, int> _knownIndirectPeers = {};
+
+  void _scheduleAnnounce() {
+    _announceTimer?.cancel();
+    _announceTimer = Timer.periodic(
+      const Duration(milliseconds: kAnnounceIntervalMs),
+      (_) => _broadcastPresence(),
+    );
+    _broadcastPresence();
+  }
+
+  void _scheduleIndirectPeerExpiry() {
+    _indirectExpiryTimer?.cancel();
+    _indirectExpiryTimer = Timer.periodic(
+      const Duration(milliseconds: kAnnounceIntervalMs),
+      (_) {
+        final now = DateTime.now().millisecondsSinceEpoch;
+        _knownIndirectPeers.removeWhere(
+          (_, lastSeenMs) => now - lastSeenMs > kIndirectPeerExpiryMs,
+        );
+      },
+    );
+  }
+
+  Future<void> _broadcastPresence() async {
+    if (!_running) return;
+    final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+    final packet = buildAnnouncePacket(
+      ttl: kDefaultTtl,
+      peerId: myPeerId,
+      nonce: _randomNonce(),
+    );
+    await _floodSend(packet);
+  }
+
+  Future<void> _handleAnnouncePacket(Uint8List payload) async {
+    final parsed = parseAnnouncePacket(payload);
+    if (parsed == null) return;
+    final (:ttl, :peerId, :nonce) = parsed;
+
+    final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+    if (peerId == myPeerId) return;
+
+    final dedupKey = 'announce:$peerId:$nonce';
+    if (_dedupCache.contains(dedupKey)) return;
+    _dedupCache.put(dedupKey);
+
+    final alreadyKnown =
+        _peers.values.any((n) => n.shortId == peerId) ||
+        _knownIndirectPeers.containsKey(peerId);
+    _knownIndirectPeers[peerId] = DateTime.now().millisecondsSinceEpoch;
+    if (!alreadyKnown) {
+      _indirectPeerController.add(
+        MeshNode(
+          identity: _placeholderIdentity(peerId),
+          rssi: 0,
+          lastSeenMs: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+    }
+
+    if (ttl > 0) {
+      final relayed = buildAnnouncePacket(
+        ttl: ttl - 1,
+        peerId: peerId,
+        nonce: nonce,
+      );
+      unawaited(_floodSend(relayed));
+    }
+  }
+
+  /// A 32-byte placeholder identity whose first 8 bytes match [shortId] —
+  /// used only for gossip-only [MeshNode]s (before a real session reveals
+  /// the peer's actual static public key). Never used for anything besides
+  /// `.shortId` display/lookup.
+  Uint8List _placeholderIdentity(String shortId) {
+    final identity = Uint8List(32);
+    identity.setRange(0, 8, hexToBytes(shortId));
+    return identity;
+  }
+
+  int _randomNonce() => Random().nextInt(0xFFFFFFFF);
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  String _bytesToHex(Uint8List bytes) =>
-      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  void _log(String message) {
+    if (!_discoveryLogController.isClosed) {
+      _discoveryLogController.add(message);
+    }
+  }
 
   /// Returns a snapshot of currently connected peers.
   List<MeshNode> get connectedPeers => List.unmodifiable(_peers.values);

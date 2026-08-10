@@ -68,6 +68,8 @@ void main() {
 
       final chunks = await FileChunker.chunkFile(
         msg.toBytes(),
+        originPeerId: 'aaaaaaaaaaaaaaaa',
+        destPeerId: 'bbbbbbbbbbbbbbbb',
         type: PayloadType.message,
         transferId: msg.messageId,
       );
@@ -76,7 +78,8 @@ void main() {
     });
 
     test('message survives chunk → reassemble round trip', () async {
-      const content = 'This is a test message that spans multiple BLE chunks '
+      const content =
+          'This is a test message that spans multiple BLE chunks '
           'because it is longer than twenty bytes.';
       final msg = TextMessage(
         messageId: 'msg-002',
@@ -89,6 +92,8 @@ void main() {
 
       final chunks = await FileChunker.chunkFile(
         msg.toBytes(),
+        originPeerId: 'aaaaaaaaaaaaaaaa',
+        destPeerId: 'bbbbbbbbbbbbbbbb',
         type: PayloadType.message,
         transferId: msg.messageId,
       );
@@ -116,6 +121,8 @@ void main() {
     test('file chunks still carry PayloadType.file by default', () async {
       final chunks = await FileChunker.chunkFile(
         Uint8List.fromList(List.filled(40, 0x42)),
+        originPeerId: 'aaaaaaaaaaaaaaaa',
+        destPeerId: 'bbbbbbbbbbbbbbbb',
       );
       expect(chunks.every((c) => c.payloadType == PayloadType.file), isTrue);
     });
@@ -160,22 +167,26 @@ void main() {
 
     test('messages are sorted oldest-first', () {
       final store = MessageStore();
-      store.upsert(TextMessage(
-        messageId: 'later',
-        senderPeerId: 'peer-a',
-        recipientPeerId: 'peer-b',
-        content: 'Second',
-        timestampMs: 2000,
-        isOutgoing: true,
-      ));
-      store.upsert(TextMessage(
-        messageId: 'earlier',
-        senderPeerId: 'peer-a',
-        recipientPeerId: 'peer-b',
-        content: 'First',
-        timestampMs: 1000,
-        isOutgoing: true,
-      ));
+      store.upsert(
+        TextMessage(
+          messageId: 'later',
+          senderPeerId: 'peer-a',
+          recipientPeerId: 'peer-b',
+          content: 'Second',
+          timestampMs: 2000,
+          isOutgoing: true,
+        ),
+      );
+      store.upsert(
+        TextMessage(
+          messageId: 'earlier',
+          senderPeerId: 'peer-a',
+          recipientPeerId: 'peer-b',
+          content: 'First',
+          timestampMs: 1000,
+          isOutgoing: true,
+        ),
+      );
 
       final thread = store.messagesFor('peer-b');
       expect(thread.first.content, equals('First'));

@@ -6,31 +6,32 @@ import 'package:meshshare/features/file_transfer/transfer_progress.dart';
 import 'package:meshshare/features/ui/transfer_progress_screen.dart';
 
 void main() {
-  testWidgets('TransferProgressWidget shows label and percentage while sending',
-      (WidgetTester tester) async {
-    const progress = TransferProgress(
-      transferId: 'abc123',
-      label: 'photo.jpg',
-      progress: 0.4,
-      status: TransferStatus.sending,
-      type: PayloadType.file,
-      peerId: 'peer001',
-    );
+  testWidgets(
+    'TransferProgressWidget shows label and percentage while sending',
+    (WidgetTester tester) async {
+      const progress = TransferProgress(
+        transferId: 'abc123',
+        label: 'photo.jpg',
+        progress: 0.4,
+        status: TransferStatus.sending,
+        type: PayloadType.file,
+        peerId: 'peer001',
+      );
 
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(
-          body: TransferProgressWidget(progress: progress),
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: TransferProgressWidget(progress: progress)),
         ),
-      ),
-    );
+      );
 
-    expect(find.text('photo.jpg'), findsOneWidget);
-    expect(find.text('Sending… 40%'), findsOneWidget);
-  });
+      expect(find.text('photo.jpg'), findsOneWidget);
+      expect(find.text('Sending… 40%'), findsOneWidget);
+    },
+  );
 
-  testWidgets('TransferProgressWidget shows "Complete" when done',
-      (WidgetTester tester) async {
+  testWidgets('TransferProgressWidget shows "Complete" when done', (
+    WidgetTester tester,
+  ) async {
     const progress = TransferProgress(
       transferId: 'abc123',
       label: 'report.pdf',
@@ -42,9 +43,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(
-          body: TransferProgressWidget(progress: progress),
-        ),
+        home: Scaffold(body: TransferProgressWidget(progress: progress)),
       ),
     );
 

@@ -21,6 +21,19 @@ String generateUuid() {
       '${hex(bytes[10])}${hex(bytes[11])}${hex(bytes[12])}${hex(bytes[13])}${hex(bytes[14])}${hex(bytes[15])}';
 }
 
+/// Hex-encode [bytes] (lowercase, no separators).
+String bytesToHex(List<int> bytes) =>
+    bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+/// Decode a lowercase hex string into raw bytes.
+Uint8List hexToBytes(String hex) {
+  final bytes = Uint8List(hex.length ~/ 2);
+  for (var i = 0; i < bytes.length; i++) {
+    bytes[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+  }
+  return bytes;
+}
+
 /// Fixed-capacity LRU (Least Recently Used) cache.
 ///
 /// When the cache is full, the oldest-accessed entry is evicted.

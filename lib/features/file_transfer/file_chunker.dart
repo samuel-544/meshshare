@@ -23,13 +23,18 @@ class FileChunker {
   /// of its plaintext payload so the receiver can verify after decryption.
   static Future<List<FileChunk>> chunkFile(
     Uint8List bytes, {
+    required String originPeerId,
+    required String destPeerId,
     PayloadType type = PayloadType.file,
     String? transferId, // pass message ID when type == message
+    String? fileName,
   }) async {
     final sha256 = Sha256();
     final fileId = transferId ?? generateUuid();
-    final totalChunks =
-        (bytes.length / kBleChunkPayloadBytes).ceil().clamp(1, 1 << 31);
+    final totalChunks = (bytes.length / kBleChunkPayloadBytes).ceil().clamp(
+      1,
+      1 << 31,
+    );
     final chunks = <FileChunk>[];
 
     for (int i = 0; i < totalChunks; i++) {
@@ -40,15 +45,20 @@ class FileChunker {
       final hash = await sha256.hash(payload);
       final checksum = Uint8List.fromList(hash.bytes);
 
-      chunks.add(FileChunk(
-        fileId: fileId,
-        chunkIndex: i,
-        totalChunks: totalChunks,
-        data: Uint8List.fromList(payload),
-        checksum: checksum,
-        ttl: kDefaultTtl,
-        payloadType: type,
-      ));
+      chunks.add(
+        FileChunk(
+          fileId: fileId,
+          chunkIndex: i,
+          totalChunks: totalChunks,
+          data: Uint8List.fromList(payload),
+          checksum: checksum,
+          ttl: kDefaultTtl,
+          originPeerId: originPeerId,
+          destPeerId: destPeerId,
+          payloadType: type,
+          fileName: type == PayloadType.file ? fileName : null,
+        ),
+      );
     }
 
     return chunks;

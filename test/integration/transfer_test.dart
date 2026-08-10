@@ -35,7 +35,12 @@ Future<Uint8List> _transferFile({
   final sendKey = senderKeys.sessionSendKey(receiverPeerId)!;
   final receiveKey = receiverKeys.sessionReceiveKey(senderPeerId)!;
 
-  final chunks = await FileChunker.chunkFile(bytes, type: type);
+  final chunks = await FileChunker.chunkFile(
+    bytes,
+    originPeerId: senderPeerId.substring(0, 16),
+    destPeerId: receiverPeerId.substring(0, 16),
+    type: type,
+  );
   final encrypted = [
     for (final c in chunks) await AeadCipher.encryptChunk(c, sendKey),
   ];
@@ -110,28 +115,29 @@ void main() {
 
     // ── Test 1: basic round-trip ────────────────────────────────────────────
 
-    test('file bytes survive encrypt → chunk → decrypt → assemble (1 KB)', () async {
-      final original = Uint8List.fromList(
-        List.generate(1024, (i) => (i * 31 + 7) % 256),
-      );
+    test(
+      'file bytes survive encrypt → chunk → decrypt → assemble (1 KB)',
+      () async {
+        final original = Uint8List.fromList(
+          List.generate(1024, (i) => (i * 31 + 7) % 256),
+        );
 
-      final assembled = await _transferFile(
-        bytes: original,
-        senderKeys: senderKeys,
-        receiverKeys: receiverKeys,
-        senderPeerId: senderPeerId,
-        receiverPeerId: receiverPeerId,
-      );
+        final assembled = await _transferFile(
+          bytes: original,
+          senderKeys: senderKeys,
+          receiverKeys: receiverKeys,
+          senderPeerId: senderPeerId,
+          receiverPeerId: receiverPeerId,
+        );
 
-      expect(assembled, equals(original));
-    });
+        expect(assembled, equals(original));
+      },
+    );
 
     // ── Test 2: out-of-order delivery ─────────────────────────────────────
 
     test('out-of-order chunk delivery assembles correctly', () async {
-      final original = Uint8List.fromList(
-        List.generate(500, (i) => i % 256),
-      );
+      final original = Uint8List.fromList(List.generate(500, (i) => i % 256));
 
       // Deliver chunks in reverse order — BLE mesh reordering simulation.
       final assembled = await _transferFile(
@@ -154,7 +160,12 @@ void main() {
       final sendKey = senderKeys.sessionSendKey(receiverPeerId)!;
       final receiveKey = receiverKeys.sessionReceiveKey(senderPeerId)!;
 
-      final chunks = await FileChunker.chunkFile(original, type: PayloadType.file);
+      final chunks = await FileChunker.chunkFile(
+        original,
+        originPeerId: senderPeerId.substring(0, 16),
+        destPeerId: receiverPeerId.substring(0, 16),
+        type: PayloadType.file,
+      );
       final encrypted = [
         for (final c in chunks) await AeadCipher.encryptChunk(c, sendKey),
       ];
@@ -170,6 +181,8 @@ void main() {
         checksum: first.checksum,
         ttl: first.ttl,
         payloadType: first.payloadType,
+        originPeerId: first.originPeerId,
+        destPeerId: first.destPeerId,
       );
 
       // AEAD must throw when the MAC tag does not match.
@@ -187,33 +200,40 @@ void main() {
 
     // ── Test 4: 2-hop relay ────────────────────────────────────────────────
 
-    test('2-hop relay: sender → relay1 → relay2 → receiver — file arrives intact',
-        () async {
-      final original = Uint8List.fromList(
-        List.generate(600, (i) => (i * 13 + 3) % 256),
-      );
+    test(
+      '2-hop relay: sender → relay1 → relay2 → receiver — file arrives intact',
+      () async {
+        final original = Uint8List.fromList(
+          List.generate(600, (i) => (i * 13 + 3) % 256),
+        );
 
-      // Each relay decrements TTL and blindly forwards (no decryption).
-      final assembled = await _transferFile(
-        bytes: original,
-        senderKeys: senderKeys,
-        receiverKeys: receiverKeys,
-        senderPeerId: senderPeerId,
-        receiverPeerId: receiverPeerId,
-        transmit: (chunks) => chunks
-            .map((c) => c.decrementTtl()) // relay 1
-            .map((c) => c.decrementTtl()) // relay 2
-            .toList(),
-      );
+        // Each relay decrements TTL and blindly forwards (no decryption).
+        final assembled = await _transferFile(
+          bytes: original,
+          senderKeys: senderKeys,
+          receiverKeys: receiverKeys,
+          senderPeerId: senderPeerId,
+          receiverPeerId: receiverPeerId,
+          transmit: (chunks) => chunks
+              .map((c) => c.decrementTtl()) // relay 1
+              .map((c) => c.decrementTtl()) // relay 2
+              .toList(),
+        );
 
-      expect(assembled, equals(original));
-    });
+        expect(assembled, equals(original));
+      },
+    );
 
     test('relay chunks carry decremented TTL', () async {
       final original = Uint8List.fromList([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
       final sendKey = senderKeys.sessionSendKey(receiverPeerId)!;
-      final chunks = await FileChunker.chunkFile(original, type: PayloadType.file);
+      final chunks = await FileChunker.chunkFile(
+        original,
+        originPeerId: senderPeerId.substring(0, 16),
+        destPeerId: receiverPeerId.substring(0, 16),
+        type: PayloadType.file,
+      );
       final encrypted = [
         for (final c in chunks) await AeadCipher.encryptChunk(c, sendKey),
       ];
@@ -245,24 +265,29 @@ void main() {
 
     // ── Test 6: duplicate chunk deduplication ─────────────────────────────
 
-    test('duplicate chunks at receiver are deduplicated — final bytes are correct',
-        () async {
-      final original = Uint8List.fromList(
-        List.generate(200, (i) => (i * 7) % 256),
-      );
+    test(
+      'duplicate chunks at receiver are deduplicated — final bytes are correct',
+      () async {
+        final original = Uint8List.fromList(
+          List.generate(200, (i) => (i * 7) % 256),
+        );
 
-      // Deliver every chunk twice to simulate a relay loop.
-      final assembled = await _transferFile(
-        bytes: original,
-        senderKeys: senderKeys,
-        receiverKeys: receiverKeys,
-        senderPeerId: senderPeerId,
-        receiverPeerId: receiverPeerId,
-        transmit: (chunks) => [...chunks, ...chunks], // each chunk delivered twice
-      );
+        // Deliver every chunk twice to simulate a relay loop.
+        final assembled = await _transferFile(
+          bytes: original,
+          senderKeys: senderKeys,
+          receiverKeys: receiverKeys,
+          senderPeerId: senderPeerId,
+          receiverPeerId: receiverPeerId,
+          transmit: (chunks) => [
+            ...chunks,
+            ...chunks,
+          ], // each chunk delivered twice
+        );
 
-      expect(assembled, equals(original));
-    });
+        expect(assembled, equals(original));
+      },
+    );
 
     // ── Test 7: text message round-trip ───────────────────────────────────
 
@@ -271,8 +296,12 @@ void main() {
       final msgBytes = Uint8List.fromList(utf8.encode(text));
 
       final sendKey = senderKeys.sessionSendKey(receiverPeerId)!;
-      final chunks =
-          await FileChunker.chunkFile(msgBytes, type: PayloadType.message);
+      final chunks = await FileChunker.chunkFile(
+        msgBytes,
+        originPeerId: senderPeerId.substring(0, 16),
+        destPeerId: receiverPeerId.substring(0, 16),
+        type: PayloadType.message,
+      );
 
       // All chunks must carry the message payload type.
       expect(chunks.every((c) => c.payloadType == PayloadType.message), isTrue);
@@ -313,22 +342,34 @@ void main() {
 
     // ── Test 9: two independent sessions produce different ciphertexts ────
 
-    test('two transfers of identical bytes produce different ciphertexts (unique fileIds)',
-        () async {
-      final original = Uint8List.fromList(List.generate(40, (_) => 0xAA));
+    test(
+      'two transfers of identical bytes produce different ciphertexts (unique fileIds)',
+      () async {
+        final original = Uint8List.fromList(List.generate(40, (_) => 0xAA));
 
-      final sendKey = senderKeys.sessionSendKey(receiverPeerId)!;
+        final sendKey = senderKeys.sessionSendKey(receiverPeerId)!;
 
-      final chunksA = await FileChunker.chunkFile(original, type: PayloadType.file);
-      final chunksB = await FileChunker.chunkFile(original, type: PayloadType.file);
+        final chunksA = await FileChunker.chunkFile(
+          original,
+          originPeerId: senderPeerId.substring(0, 16),
+          destPeerId: receiverPeerId.substring(0, 16),
+          type: PayloadType.file,
+        );
+        final chunksB = await FileChunker.chunkFile(
+          original,
+          originPeerId: senderPeerId.substring(0, 16),
+          destPeerId: receiverPeerId.substring(0, 16),
+          type: PayloadType.file,
+        );
 
-      // Different fileIds → different nonces → different ciphertexts
-      expect(chunksA.first.fileId, isNot(equals(chunksB.first.fileId)));
+        // Different fileIds → different nonces → different ciphertexts
+        expect(chunksA.first.fileId, isNot(equals(chunksB.first.fileId)));
 
-      final encA = await AeadCipher.encryptChunk(chunksA.first, sendKey);
-      final encB = await AeadCipher.encryptChunk(chunksB.first, sendKey);
+        final encA = await AeadCipher.encryptChunk(chunksA.first, sendKey);
+        final encB = await AeadCipher.encryptChunk(chunksB.first, sendKey);
 
-      expect(encA.data, isNot(equals(encB.data)));
-    });
+        expect(encA.data, isNot(equals(encB.data)));
+      },
+    );
   });
 }

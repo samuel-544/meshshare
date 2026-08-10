@@ -8,7 +8,7 @@ void main() {
   group('FileAssembler', () {
     test('reassembles chunks in order', () async {
       final original = Uint8List.fromList(List.generate(60, (i) => i % 256));
-      final chunks = await FileChunker.chunkFile(original);
+      final chunks = await FileChunker.chunkFile(original, originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb');
 
       final assembler = FileAssembler(
         fileId: chunks.first.fileId,
@@ -24,7 +24,7 @@ void main() {
 
     test('reassembles out-of-order chunks correctly', () async {
       final original = Uint8List.fromList(List.generate(60, (i) => i % 256));
-      final chunks = await FileChunker.chunkFile(original);
+      final chunks = await FileChunker.chunkFile(original, originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb');
       final shuffled = [...chunks]..shuffle();
 
       final assembler = FileAssembler(
@@ -41,7 +41,7 @@ void main() {
 
     test('isComplete is false while chunks are missing', () async {
       final original = Uint8List(40); // 2 chunks
-      final chunks = await FileChunker.chunkFile(original);
+      final chunks = await FileChunker.chunkFile(original, originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb');
 
       final assembler = FileAssembler(
         fileId: chunks.first.fileId,
@@ -55,7 +55,7 @@ void main() {
 
     test('throws StateError if assembled before complete', () async {
       final original = Uint8List(40);
-      final chunks = await FileChunker.chunkFile(original);
+      final chunks = await FileChunker.chunkFile(original, originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb');
 
       final assembler = FileAssembler(
         fileId: chunks.first.fileId,
@@ -68,7 +68,7 @@ void main() {
 
     test('duplicate chunks are ignored', () async {
       final original = Uint8List(20); // 1 chunk
-      final chunks = await FileChunker.chunkFile(original);
+      final chunks = await FileChunker.chunkFile(original, originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb');
 
       final assembler = FileAssembler(
         fileId: chunks.first.fileId,

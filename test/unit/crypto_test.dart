@@ -23,6 +23,8 @@ void main() {
     test('encrypt then decrypt yields original plaintext', () async {
       final chunks = await FileChunker.chunkFile(
         Uint8List.fromList(List.generate(60, (i) => i)),
+        originPeerId: 'aaaaaaaaaaaaaaaa',
+        destPeerId: 'bbbbbbbbbbbbbbbb',
       );
 
       for (final plain in chunks) {
@@ -35,6 +37,8 @@ void main() {
     test('encrypted data differs from plaintext', () async {
       final plain = (await FileChunker.chunkFile(
         Uint8List.fromList(List.filled(20, 0xAB)),
+        originPeerId: 'aaaaaaaaaaaaaaaa',
+        destPeerId: 'bbbbbbbbbbbbbbbb',
       )).first;
 
       final encrypted = await AeadCipher.encryptChunk(plain, key);
@@ -42,7 +46,7 @@ void main() {
     });
 
     test('tampered ciphertext (flipped bit) throws on decrypt', () async {
-      final plain = (await FileChunker.chunkFile(Uint8List(20))).first;
+      final plain = (await FileChunker.chunkFile(Uint8List(20), originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb')).first;
       final encrypted = await AeadCipher.encryptChunk(plain, key);
 
       // Flip the first byte of the ciphertext.
@@ -56,6 +60,8 @@ void main() {
         data: tampered,
         checksum: encrypted.checksum,
         ttl: encrypted.ttl,
+        originPeerId: encrypted.originPeerId,
+        destPeerId: encrypted.destPeerId,
       );
 
       expect(
@@ -65,9 +71,9 @@ void main() {
     });
 
     test('wrong key throws on decrypt', () async {
-      final plain = (await FileChunker.chunkFile(Uint8List(20))).first;
+      final plain = (await FileChunker.chunkFile(Uint8List(20), originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb')).first;
       final encrypted = await AeadCipher.encryptChunk(plain, key);
-      final wrongKey  = await Chacha20.poly1305Aead().newSecretKey();
+      final wrongKey = await Chacha20.poly1305Aead().newSecretKey();
 
       expect(
         () => AeadCipher.decryptChunk(encrypted, wrongKey),
@@ -75,34 +81,45 @@ void main() {
       );
     });
 
-    test('different chunks produce different ciphertexts (unique nonces)', () async {
-      final chunks = await FileChunker.chunkFile(
-        Uint8List.fromList(List.filled(40, 0x11)),
-      );
-      final enc0 = await AeadCipher.encryptChunk(chunks[0], key);
-      final enc1 = await AeadCipher.encryptChunk(chunks[1], key);
+    test(
+      'different chunks produce different ciphertexts (unique nonces)',
+      () async {
+        final chunks = await FileChunker.chunkFile(
+          Uint8List.fromList(List.filled(40, 0x11)),
+          originPeerId: 'aaaaaaaaaaaaaaaa',
+          destPeerId: 'bbbbbbbbbbbbbbbb',
+        );
+        final enc0 = await AeadCipher.encryptChunk(chunks[0], key);
+        final enc1 = await AeadCipher.encryptChunk(chunks[1], key);
 
-      // Same key, different nonces → different ciphertexts.
-      expect(enc0.data, isNot(equals(enc1.data)));
-    });
+        // Same key, different nonces → different ciphertexts.
+        expect(enc0.data, isNot(equals(enc1.data)));
+      },
+    );
 
     test('encryption is deterministic for same inputs', () async {
-      final plain = (await FileChunker.chunkFile(Uint8List(20))).first;
+      final plain = (await FileChunker.chunkFile(Uint8List(20), originPeerId: 'aaaaaaaaaaaaaaaa', destPeerId: 'bbbbbbbbbbbbbbbb')).first;
       final enc1 = await AeadCipher.encryptChunk(plain, key);
       final enc2 = await AeadCipher.encryptChunk(plain, key);
       expect(enc1.data, equals(enc2.data));
     });
 
     test('fileId and metadata are preserved after encrypt/decrypt', () async {
-      final plain = (await FileChunker.chunkFile(Uint8List(20))).first;
-      final enc   = await AeadCipher.encryptChunk(plain, key);
-      final dec   = await AeadCipher.decryptChunk(enc, key);
+      final plain = (await FileChunker.chunkFile(
+        Uint8List(20),
+        originPeerId: 'aaaaaaaaaaaaaaaa',
+        destPeerId: 'bbbbbbbbbbbbbbbb',
+        fileName: 'photo.jpg',
+      )).first;
+      final enc = await AeadCipher.encryptChunk(plain, key);
+      final dec = await AeadCipher.decryptChunk(enc, key);
 
-      expect(dec.fileId,      equals(plain.fileId));
-      expect(dec.chunkIndex,  equals(plain.chunkIndex));
+      expect(dec.fileId, equals(plain.fileId));
+      expect(dec.chunkIndex, equals(plain.chunkIndex));
       expect(dec.totalChunks, equals(plain.totalChunks));
-      expect(dec.ttl,         equals(kDefaultTtl));
-      expect(dec.checksum,    equals(plain.checksum));
+      expect(dec.ttl, equals(kDefaultTtl));
+      expect(dec.checksum, equals(plain.checksum));
+      expect(dec.fileName, equals('photo.jpg'));
     });
   });
 
@@ -114,10 +131,8 @@ void main() {
 
     setUp(() async {
       final x25519 = X25519();
-      initiatorStatic = await x25519.newKeyPair()
-          .then((kp) => kp.extract());
-      responderStatic = await x25519.newKeyPair()
-          .then((kp) => kp.extract());
+      initiatorStatic = await x25519.newKeyPair().then((kp) => kp.extract());
+      responderStatic = await x25519.newKeyPair().then((kp) => kp.extract());
     });
 
     test('full handshake completes without error', () async {
@@ -226,8 +241,8 @@ void main() {
     });
 
     test('generates a keypair and saves it to disk', () async {
-      final km  = KeyManager.forTesting(tmpDir);
-      final kp  = await km.getOrCreateStaticKeyPair();
+      final km = KeyManager.forTesting(tmpDir);
+      final kp = await km.getOrCreateStaticKeyPair();
 
       expect(kp.bytes.length, equals(32));
       expect(kp.publicKey.bytes.length, equals(32));
@@ -237,23 +252,29 @@ void main() {
       expect((await keyFile.readAsBytes()).length, equals(64));
     });
 
-    test('returns the same keypair on subsequent calls (in-memory cache)', () async {
-      final km = KeyManager.forTesting(tmpDir);
-      final kp1 = await km.getOrCreateStaticKeyPair();
-      final kp2 = await km.getOrCreateStaticKeyPair();
-      expect(identical(kp1, kp2), isTrue);
-    });
+    test(
+      'returns the same keypair on subsequent calls (in-memory cache)',
+      () async {
+        final km = KeyManager.forTesting(tmpDir);
+        final kp1 = await km.getOrCreateStaticKeyPair();
+        final kp2 = await km.getOrCreateStaticKeyPair();
+        expect(identical(kp1, kp2), isTrue);
+      },
+    );
 
-    test('reloads the same keypair from disk after restart (new instance)', () async {
-      final km1 = KeyManager.forTesting(tmpDir);
-      final kp1 = await km1.getOrCreateStaticKeyPair();
+    test(
+      'reloads the same keypair from disk after restart (new instance)',
+      () async {
+        final km1 = KeyManager.forTesting(tmpDir);
+        final kp1 = await km1.getOrCreateStaticKeyPair();
 
-      final km2 = KeyManager.forTesting(tmpDir); // simulates app restart
-      final kp2 = await km2.getOrCreateStaticKeyPair();
+        final km2 = KeyManager.forTesting(tmpDir); // simulates app restart
+        final kp2 = await km2.getOrCreateStaticKeyPair();
 
-      expect(kp1.bytes, equals(kp2.bytes));
-      expect(kp1.publicKey.bytes, equals(kp2.publicKey.bytes));
-    });
+        expect(kp1.bytes, equals(kp2.bytes));
+        expect(kp1.publicKey.bytes, equals(kp2.publicKey.bytes));
+      },
+    );
 
     test('localPeerId is a 64-char hex string', () async {
       final km = KeyManager.forTesting(tmpDir);
@@ -262,11 +283,14 @@ void main() {
       expect(RegExp(r'^[0-9a-f]+$').hasMatch(id), isTrue);
     });
 
-    test('localPeerId is stable across instances (same underlying key)', () async {
-      final id1 = await KeyManager.forTesting(tmpDir).localPeerId();
-      final id2 = await KeyManager.forTesting(tmpDir).localPeerId();
-      expect(id1, equals(id2));
-    });
+    test(
+      'localPeerId is stable across instances (same underlying key)',
+      () async {
+        final id1 = await KeyManager.forTesting(tmpDir).localPeerId();
+        final id2 = await KeyManager.forTesting(tmpDir).localPeerId();
+        expect(id1, equals(id2));
+      },
+    );
 
     test('session keys stored and retrieved correctly', () async {
       final km = KeyManager.forTesting(tmpDir);
@@ -277,17 +301,25 @@ void main() {
 
       km.storeSession(peerId, send, recv);
 
-      expect(km.sessionSendKey(peerId),    isNotNull);
+      expect(km.sessionSendKey(peerId), isNotNull);
       expect(km.sessionReceiveKey(peerId), isNotNull);
-      expect(km.hasSession(peerId),        isTrue);
+      expect(km.hasSession(peerId), isTrue);
     });
 
     test('clearSession removes keys for that peer only', () async {
-      final km   = KeyManager.forTesting(tmpDir);
+      final km = KeyManager.forTesting(tmpDir);
       final algo = Chacha20.poly1305Aead();
 
-      km.storeSession('peer-a', await algo.newSecretKey(), await algo.newSecretKey());
-      km.storeSession('peer-b', await algo.newSecretKey(), await algo.newSecretKey());
+      km.storeSession(
+        'peer-a',
+        await algo.newSecretKey(),
+        await algo.newSecretKey(),
+      );
+      km.storeSession(
+        'peer-b',
+        await algo.newSecretKey(),
+        await algo.newSecretKey(),
+      );
 
       km.clearSession('peer-a');
 
@@ -297,7 +329,7 @@ void main() {
 
     test('session keys return null for unknown peer', () async {
       final km = KeyManager.forTesting(tmpDir);
-      expect(km.sessionSendKey('nobody'),    isNull);
+      expect(km.sessionSendKey('nobody'), isNull);
       expect(km.sessionReceiveKey('nobody'), isNull);
     });
   });

@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../../core/constants.dart';
@@ -450,10 +451,25 @@ class BleMeshService {
       }
     });
 
-    await FlutterBluePlus.startScan(
-      withServices: [Guid(kServiceUuid)],
-      timeout: const Duration(seconds: 4),
-    );
+    try {
+      await FlutterBluePlus.startScan(
+        withServices: [Guid(kServiceUuid)],
+        timeout: const Duration(seconds: 4),
+      );
+    } catch (e, st) {
+      developer.log(
+        'BLE scan failed to start',
+        name: 'MeshShare.BLE',
+        error: e,
+        stackTrace: st,
+      );
+      if (e is PlatformException &&
+          (e.message?.toLowerCase().contains('location') ?? false)) {
+        _log('Please enable Location Services to scan for nearby devices.');
+      } else {
+        _log('Could not start scanning for nearby devices.');
+      }
+    }
   }
 
   void _onScanResult(ScanResult result) {
@@ -618,7 +634,7 @@ class BleMeshService {
         error: e,
         stackTrace: st,
       );
-      _log('Could not complete discovery for one device.');
+      _log('Could not complete discovery for one device: $e');
       _connectRetryAfter[deviceId] = DateTime.now().add(
         const Duration(seconds: 15),
       );

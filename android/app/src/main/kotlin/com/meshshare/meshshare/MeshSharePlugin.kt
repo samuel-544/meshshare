@@ -59,6 +59,13 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
     private var identityCharacteristic: BluetoothGattCharacteristic? = null
     private var localIdentity: ByteArray? = null
 
+    // addService() is async — the service isn't actually queryable by a
+    // connecting Central until onServiceAdded() confirms it. Advertising
+    // must not start before that, or a Central can connect and call
+    // discoverServices() into an empty/incomplete GATT table.
+    private var serviceReady = false
+    private var pendingAdvertiseIdentity: ByteArray? = null
+
     // ── FlutterPlugin lifecycle ───────────────────────────────────────────────
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -122,7 +129,15 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
                 localIdentity = identity
                 identityCharacteristic?.value = identity
                 stopAdvertising()
-                if (identity != null) startAdvertising(identity)
+                if (identity != null) {
+                    if (serviceReady) {
+                        startAdvertising(identity)
+                    } else {
+                        // GATT service not confirmed yet — advertise as soon as
+                        // onServiceAdded() fires instead of racing it.
+                        pendingAdvertiseIdentity = identity
+                    }
+                }
                 result.success(null)
             }
             "sendRawNotification" -> {
@@ -149,6 +164,8 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
     // ── GATT server ───────────────────────────────────────────────────────────
 
     private fun startGattServer() {
+        serviceReady = false
+        pendingAdvertiseIdentity = null
         gattServer = bluetoothManager?.openGattServer(context, gattServerCallback)
 
         // Build service
@@ -196,6 +213,8 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
     private fun stopGattServer() {
         gattServer?.close()
         gattServer = null
+        serviceReady = false
+        pendingAdvertiseIdentity = null
     }
 
     // Connected devices: address → BluetoothDevice (so we can notify them).
@@ -209,6 +228,13 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
             } else {
                 connectedCentrals.remove(device.address)
             }
+        }
+
+        override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            if (status != BluetoothGatt.GATT_SUCCESS || service.uuid != SERVICE_UUID) return
+            serviceReady = true
+            pendingAdvertiseIdentity?.let { startAdvertising(it) }
+            pendingAdvertiseIdentity = null
         }
 
         override fun onCharacteristicWriteRequest(

@@ -223,11 +223,21 @@ class MeshSharePlugin : FlutterPlugin, MethodCallHandler {
     private val gattServerCallback = object : BluetoothGattServerCallback() {
 
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
+            val connected = newState == BluetoothProfile.STATE_CONNECTED
+            if (connected) {
                 connectedCentrals[device.address] = device
             } else {
                 connectedCentrals.remove(device.address)
             }
+            // Tell Dart about the link-state change on this (Peripheral-side)
+            // GATT link. Without the disconnect signal, a peer that completed a
+            // handshake against our GATT server stays "online" in the UI forever
+            // because the Central-side connectionState stream never sees it.
+            sendEvent(mapOf(
+                "type"      to "peripheralLink",
+                "deviceId"  to device.address,
+                "connected" to connected
+            ))
         }
 
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {

@@ -27,6 +27,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final List<MeshNode> _peers = [];
   StreamSubscription<MeshNode>? _peerSub;
+  StreamSubscription<String>? _peerLostSub;
   StreamSubscription<SavedFile>? _savedFileSub;
   bool _scanning = false;
 
@@ -52,6 +53,11 @@ class _HomeScreenState extends State<HomeScreen> {
           _peers.add(node);
         }
       });
+    });
+
+    _peerLostSub = ble.peerLost.listen((shortId) {
+      if (!mounted) return;
+      setState(() => _peers.removeWhere((p) => p.shortId == shortId));
     });
 
     _savedFileSub = tm.savedFiles.listen((file) {
@@ -119,6 +125,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _peerSub?.cancel();
+    _peerLostSub?.cancel();
     _savedFileSub?.cancel();
     super.dispose();
   }

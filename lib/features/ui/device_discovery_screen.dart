@@ -28,6 +28,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
   final List<String> _logs = [];
   StreamSubscription<MeshNode>? _sub;
   StreamSubscription<MeshNode>? _indirectSub;
+  StreamSubscription<String>? _peerLostSub;
   StreamSubscription<String>? _logSub;
   bool _scanning = false;
 
@@ -82,6 +83,14 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
         } else {
           _indirect.add(node);
         }
+      });
+    });
+
+    _peerLostSub = ble.peerLost.listen((shortId) {
+      if (!mounted) return;
+      setState(() {
+        _discovered.removeWhere((p) => p.shortId == shortId);
+        _connectingShortIds.remove(shortId);
       });
     });
 
@@ -170,6 +179,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
   void dispose() {
     _sub?.cancel();
     _indirectSub?.cancel();
+    _peerLostSub?.cancel();
     _logSub?.cancel();
     super.dispose();
   }

@@ -215,6 +215,7 @@ class BleMeshService {
   // ── Stream controllers ────────────────────────────────────────────────────
 
   final _peerController = StreamController<MeshNode>.broadcast();
+  final _peerLostController = StreamController<String>.broadcast();
   final _indirectPeerController = StreamController<MeshNode>.broadcast();
   final _chunkController = StreamController<FileChunk>.broadcast();
   final _discoveryLogController = StreamController<String>.broadcast();
@@ -227,6 +228,11 @@ class BleMeshService {
   /// send/receive — whether the session was established directly or through
   /// a routed (multi-hop) handshake over the mesh.
   Stream<MeshNode> get discoveredPeers => _peerController.stream;
+
+  /// Emits the [MeshNode.shortId] of a peer whose direct GATT link has
+  /// dropped, so the UI can stop showing it as online. Covers links where
+  /// this device is the Central *or* the Peripheral.
+  Stream<String> get peerLost => _peerLostController.stream;
 
   /// Emits a [MeshNode] each time a peer is heard about via presence gossip
   /// but has no session yet (`deviceId` is null). Call [requestSecureSession]
@@ -306,6 +312,7 @@ class BleMeshService {
   Timer? _indirectExpiryTimer;
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
+  StreamSubscription<PeripheralLinkEvent>? _peripheralLinkSub;
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -333,6 +340,11 @@ class BleMeshService {
     );
     // Responder side: handle incoming handshake messages from Centrals.
     _channel.incomingHandshakeMessages.listen(_onIncomingHandshakeMessage);
+    // Responder side: a Central dropped its link to our GATT server — clean up
+    // that peer so it stops showing as online here.
+    _peripheralLinkSub = _channel.peripheralLinkEvents.listen((e) {
+      if (!e.connected) _onDeviceDisconnected(e.deviceId);
+    });
 
     // Watch adapter state — restart scanning if BT is toggled.
     _adapterSub = FlutterBluePlus.adapterState.listen((state) {
@@ -369,6 +381,7 @@ class BleMeshService {
     _indirectExpiryTimer?.cancel();
     _scanSub?.cancel();
     _adapterSub?.cancel();
+    _peripheralLinkSub?.cancel();
     await FlutterBluePlus.stopScan();
 
     for (final timer in _keepaliveTimers.values) {
@@ -402,6 +415,7 @@ class BleMeshService {
     // Foreground service is not started in the current foreground-only demo.
 
     await _peerController.close();
+    await _peerLostController.close();
     await _indirectPeerController.close();
     await _chunkController.close();
     await _discoveryLogController.close();
@@ -681,6 +695,9 @@ class BleMeshService {
         _keepaliveTimers.remove(peerId);
         _keepaliveMissed.remove(peerId);
         _keys.clearSession(node.shortId);
+        if (!_peerLostController.isClosed) {
+          _peerLostController.add(node.shortId);
+        }
         return true;
       }
       return false;
@@ -1017,14 +1034,21 @@ class BleMeshService {
         final peerId = await _keys.identityFor(result.remoteStaticPublicKey);
         final shortPeerId = peerId.substring(0, 16);
         _keys.storeSession(shortPeerId, result.sendKey, result.receiveKey);
-        _peers[peerId] = MeshNode(
+        final node = MeshNode(
           identity: hexToBytes(peerId),
           deviceId: deviceId,
           rssi: 0,
           lastSeenMs: DateTime.now().millisecondsSinceEpoch,
         );
+        _peers[peerId] = node;
         await _contacts?.saveHandshakePeer(peerId: shortPeerId);
         _log('Secure session ready with peer ${shortPeerId.substring(0, 8)}.');
+        // Surface the peer on THIS device too. The Central/initiator side
+        // emits it from _onHandshakeResponse; the Peripheral/responder side
+        // finishes the exact same handshake but, without this line, never
+        // tells its own UI — so the peer shows "Offline" on one phone while
+        // showing online on the other. This is the asymmetric-discovery bug.
+        _peerController.add(node);
       } catch (_) {
         // Handshake failed — ignore (Central will disconnect).
         _log('Secure handshake failed.');

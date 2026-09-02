@@ -24,6 +24,17 @@ class HandshakeEvent extends MeshEvent {
   HandshakeEvent(this.deviceId, this.step, this.data);
 }
 
+/// A Central connected to or disconnected from our GATT server — i.e. the
+/// link on which this device is the Peripheral. The disconnect signal lets
+/// [BleMeshService] tear down peer state for a peer that handshaked against
+/// our server; the Central-side `connectionState` stream never sees that
+/// link, so without this the peer stays "online" until the app restarts.
+class PeripheralLinkEvent extends MeshEvent {
+  final String deviceId;
+  final bool connected;
+  PeripheralLinkEvent(this.deviceId, this.connected);
+}
+
 // ── Channel ────────────────────────────────────────────────────────────────
 
 /// Dart-side bridge to the native Android [MeshSharePlugin].
@@ -55,6 +66,9 @@ class MeshPlatformChannel {
 
   Stream<HandshakeEvent> get incomingHandshakeMessages =>
       _events.where((e) => e is HandshakeEvent).cast<HandshakeEvent>();
+
+  Stream<PeripheralLinkEvent> get peripheralLinkEvents =>
+      _events.where((e) => e is PeripheralLinkEvent).cast<PeripheralLinkEvent>();
 
   // ── Foreground service ──────────────────────────────────────────────────
 
@@ -131,6 +145,12 @@ class MeshPlatformChannel {
           map['deviceId'] as String,
           map['step'] as int,
           Uint8List.fromList(List<int>.from(map['data'] as List)),
+        );
+
+      case 'peripheralLink':
+        return PeripheralLinkEvent(
+          map['deviceId'] as String,
+          map['connected'] as bool,
         );
 
       default:

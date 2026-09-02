@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/theme.dart';
 import '../auth/auth_service.dart';
 import 'home_screen.dart';
+import 'widgets/mesh_logo.dart';
 
 /// First-launch screen where the user creates a 6-digit PIN.
 ///
@@ -104,28 +106,20 @@ class _SetupPinScreenState extends State<SetupPinScreen> {
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Icon(
-                          Icons.lock_outline_rounded,
-                          size: 64,
-                          color: colorScheme.primary,
-                        ),
-                        const SizedBox(height: 20),
+                        const MeshLogo(size: 84),
+                        const SizedBox(height: 28),
                         Text(
                           _title,
-                          style: Theme.of(context).textTheme.headlineSmall
-                              ?.copyWith(fontWeight: FontWeight.bold),
+                          style: Theme.of(context).textTheme.displaySmall,
                           textAlign: TextAlign.center,
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 10),
                         Text(
                           _subtitle,
-                          style: Theme.of(context).textTheme.bodyMedium
-                              ?.copyWith(
-                                color: colorScheme.onSurface.withAlpha(153),
-                              ),
+                          style: Theme.of(context).textTheme.bodyMedium,
                           textAlign: TextAlign.center,
                         ),
-                        const SizedBox(height: 28),
+                        const SizedBox(height: 32),
                         _PinDots(
                           filled: _input.length,
                           total: _pinLength,
@@ -258,30 +252,22 @@ class _LockScreenState extends State<LockScreen> {
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Icon(
-                          Icons.lock_rounded,
-                          size: 64,
-                          color: colorScheme.primary,
-                        ),
-                        const SizedBox(height: 20),
+                        const MeshLogo(size: 84),
+                        const SizedBox(height: 28),
                         Text(
                           'MeshShare is locked',
-                          style: Theme.of(context).textTheme.headlineSmall
-                              ?.copyWith(fontWeight: FontWeight.bold),
+                          style: Theme.of(context).textTheme.displaySmall,
                           textAlign: TextAlign.center,
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 10),
                         Text(
                           _biometricAvailable
                               ? 'Use biometrics or enter your PIN.'
                               : 'Enter your PIN to continue.',
-                          style: Theme.of(context).textTheme.bodyMedium
-                              ?.copyWith(
-                                color: colorScheme.onSurface.withAlpha(153),
-                              ),
+                          style: Theme.of(context).textTheme.bodyMedium,
                           textAlign: TextAlign.center,
                         ),
-                        const SizedBox(height: 28),
+                        const SizedBox(height: 32),
                         _PinDots(
                           filled: _input.length,
                           total: _pinLength,
@@ -306,11 +292,18 @@ class _LockScreenState extends State<LockScreen> {
                         else
                           _NumberPad(onDigit: _onDigit, onDelete: _onDelete),
                         if (_biometricAvailable && !_checking) ...[
-                          const SizedBox(height: 20),
-                          FilledButton.tonalIcon(
+                          const SizedBox(height: 16),
+                          OutlinedButton.icon(
                             onPressed: _tryBiometric,
-                            icon: const Icon(Icons.fingerprint),
+                            icon: const Icon(
+                              Icons.fingerprint,
+                              color: MeshColors.copper,
+                            ),
                             label: const Text('Use biometric'),
+                            style: OutlinedButton.styleFrom(
+                              minimumSize: const Size(0, 46),
+                              padding: const EdgeInsets.symmetric(horizontal: 20),
+                            ),
                           ),
                         ],
                       ],
@@ -344,15 +337,20 @@ class _PinDots extends StatelessWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: List.generate(total, (i) {
+        final on = i < filled;
         return AnimatedContainer(
-          duration: const Duration(milliseconds: 120),
-          margin: const EdgeInsets.symmetric(horizontal: 8),
-          width: 16,
-          height: 16,
+          duration: const Duration(milliseconds: 140),
+          curve: Curves.easeOut,
+          margin: const EdgeInsets.symmetric(horizontal: 7),
+          width: on ? 13 : 11,
+          height: on ? 13 : 11,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
-            color: i < filled ? color : Colors.transparent,
-            border: Border.all(color: color, width: 2),
+            color: on ? color : Colors.transparent,
+            border: Border.all(
+              color: on ? color : MeshColors.outline,
+              width: 1.6,
+            ),
           ),
         );
       }),
@@ -368,7 +366,6 @@ class _NumberPad extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
     const digits = [
       ['1', '2', '3'],
       ['4', '5', '6'],
@@ -379,9 +376,11 @@ class _NumberPad extends StatelessWidget {
       onTap: () => onDigit(label),
       child: Text(
         label,
-        style: Theme.of(
-          context,
-        ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w500),
+        style: const TextStyle(
+          fontSize: 26,
+          fontWeight: FontWeight.w600,
+          color: MeshColors.text,
+        ),
       ),
     );
 
@@ -389,20 +388,25 @@ class _NumberPad extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         for (final row in digits)
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: row.map(digitButton).toList(),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 14),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: row.map(digitButton).toList(),
+            ),
           ),
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const SizedBox(width: 80, height: 72), // blank spacer
+            const SizedBox(width: 84, height: 64),
             digitButton('0'),
             _PadButton(
               onTap: onDelete,
-              child: Icon(
+              filled: false,
+              child: const Icon(
                 Icons.backspace_outlined,
-                color: colorScheme.onSurfaceVariant,
+                color: MeshColors.textDim,
+                size: 22,
               ),
             ),
           ],
@@ -415,20 +419,29 @@ class _NumberPad extends StatelessWidget {
 class _PadButton extends StatelessWidget {
   final VoidCallback onTap;
   final Widget child;
+  final bool filled;
 
-  const _PadButton({required this.onTap, required this.child});
+  const _PadButton({required this.onTap, required this.child, this.filled = true});
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 80,
-      height: 72,
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10),
       child: Material(
-        color: Colors.transparent,
+        color: filled ? MeshColors.surfaceHigh : Colors.transparent,
+        shape: CircleBorder(
+          side: filled
+              ? const BorderSide(color: MeshColors.outline)
+              : BorderSide.none,
+        ),
+        clipBehavior: Clip.antiAlias,
         child: InkWell(
-          borderRadius: BorderRadius.circular(40),
           onTap: onTap,
-          child: Center(child: child),
+          child: SizedBox(
+            width: 64,
+            height: 64,
+            child: Center(child: child),
+          ),
         ),
       ),
     );

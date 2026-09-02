@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../core/constants.dart';
+import '../../core/log.dart';
 import '../bluetooth/ble_mesh_service.dart';
 import '../bluetooth/mesh_node.dart';
 import '../crypto/aead_cipher.dart';
@@ -20,18 +22,49 @@ import 'transfer_progress.dart';
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
+/// Placeholder swapped in for a plaintext chunk right after it is encrypted,
+/// so the real (large) chunk can be garbage-collected during encryption.
+final FileChunk _emptyChunk = FileChunk(
+  fileId: '0' * 36,
+  chunkIndex: 0,
+  totalChunks: 0,
+  data: Uint8List(0),
+  checksum: Uint8List(32),
+  ttl: 0,
+  originPeerId: '0000000000000000',
+  destPeerId: '0000000000000000',
+);
+
 /// Tracks the state of a single outgoing transfer.
+///
+/// Delivery uses a fixed-size sliding window: at most [kTransferWindowSize]
+/// chunks are "in flight" (sent, not yet ACKed) at once. As ACKs arrive the
+/// window advances. A transfer whose peer disconnects is *paused*, not
+/// failed, and resumes from where it left off when the peer returns.
 class _OutgoingTransfer {
   final String transferId;
   final String label;
   final List<FileChunk> chunks; // all encrypted chunks
-  final Set<int> ackedIndices; // chunkIndices confirmed by receiver
+  final Set<int> ackedIndices = {};
+  final Set<int> inFlight = {};
   final MeshNode target;
   final PayloadType type;
-  int retryCount = 0;
   Timer? retransmitTimer;
 
-  static const int maxRetries = 10;
+  /// Index of the next chunk that has never been sent.
+  int nextIndex = 0;
+
+  /// Guards [_pump] against re-entrancy (it awaits between sends).
+  bool pumping = false;
+
+  /// chunkIndex → last time we put this chunk on the wire (Unix ms).
+  final Map<int, int> lastSentMs = {};
+
+  /// Last time a *new* ACK arrived — used to detect a stalled transfer.
+  int lastProgressMs = DateTime.now().millisecondsSinceEpoch;
+
+  /// When the peer went offline (null while the peer is connected).
+  int? pausedSinceMs;
 
   _OutgoingTransfer({
     required this.transferId,
@@ -39,15 +72,21 @@ class _OutgoingTransfer {
     required this.chunks,
     required this.target,
     required this.type,
-  }) : ackedIndices = {};
+  });
 
   bool get isComplete => ackedIndices.length == chunks.length;
-
-  List<FileChunk> get unackedChunks =>
-      chunks.where((c) => !ackedIndices.contains(c.chunkIndex)).toList();
+  bool get isPaused => pausedSinceMs != null;
 
   double get progress =>
       chunks.isEmpty ? 0 : ackedIndices.length / chunks.length;
+
+  /// In-flight chunks that have gone unACKed past the retransmit timeout.
+  List<FileChunk> overdue(int now) => [
+    for (final i in inFlight)
+      if (!ackedIndices.contains(i) &&
+          now - (lastSentMs[i] ?? 0) >= kChunkRetransmitTimeoutMs)
+        chunks[i],
+  ];
 }
 
 /// Tracks the state of a single incoming transfer.
@@ -100,6 +139,12 @@ class TransferManager {
   // Active incoming transfers: transferId → state
   final Map<String, _IncomingTransfer> _incoming = {};
 
+  /// Serialises incoming-chunk handling so assembler writes and the
+  /// create-on-first-chunk step can't race across concurrent stream events.
+  Future<void> _receiveQueue = Future<void>.value();
+
+  static final _sha256 = Sha256();
+
   // Progress events
   final _progressController = StreamController<TransferProgress>.broadcast();
 
@@ -139,23 +184,14 @@ class TransferManager {
     required String filePath,
     required MeshNode target,
   }) async {
-    final file = File(filePath);
-    final bytes = await file.readAsBytes();
-
-    if (bytes.length > kMaxFileSizeBytes) {
-      throw ArgumentError(
-        'File exceeds maximum size of ${kMaxFileSizeBytes ~/ (1024 * 1024)} MB '
-        '(${bytes.length} bytes).',
-      );
-    }
-
     final label = p.basename(filePath);
     final localShortId = (await _keys.localPeerId()).substring(0, 16);
-    final chunks = await FileChunker.chunkFile(
-      bytes,
+    // Read + chunk in a helper so the whole-file byte buffer is released
+    // before we start holding the (equally large) list of chunks.
+    final chunks = await _readAndChunk(
+      filePath,
       originPeerId: localShortId,
       destPeerId: target.shortId,
-      type: PayloadType.file,
       fileName: label,
     );
     await _startOutgoing(
@@ -163,6 +199,29 @@ class TransferManager {
       label: label,
       target: target,
       type: PayloadType.file,
+    );
+  }
+
+  Future<List<FileChunk>> _readAndChunk(
+    String filePath, {
+    required String originPeerId,
+    required String destPeerId,
+    required String fileName,
+  }) async {
+    final bytes = await File(filePath).readAsBytes();
+    if (bytes.length > kMaxFileSizeBytes) {
+      throw ArgumentError(
+        'File exceeds maximum size of ${kMaxFileSizeBytes ~/ (1024 * 1024)} MB '
+        '(${bytes.length} bytes).',
+      );
+    }
+    return FileChunker.chunkFile(
+      bytes,
+      originPeerId: originPeerId,
+      destPeerId: destPeerId,
+      type: PayloadType.file,
+      fileName: fileName,
+      payloadBytes: _ble.maxChunkPayloadBytes,
     );
   }
 
@@ -181,6 +240,7 @@ class TransferManager {
       destPeerId: target.shortId,
       type: PayloadType.message,
       transferId: message.messageId,
+      payloadBytes: _ble.maxChunkPayloadBytes,
     );
 
     final label = message.content.length <= 40
@@ -203,21 +263,32 @@ class TransferManager {
     required PayloadType type,
     String? transferId,
   }) async {
-    final sendKey = _keys.sessionSendKey(target.shortId);
-    if (sendKey == null) {
+    final tid = transferId ?? chunks.first.fileId;
+
+    // Encrypt every chunk with a transfer-scoped key derived from both
+    // devices' *static* keys. Unlike the live Noise session key, this
+    // survives a mid-transfer disconnect + re-handshake, so chunks queued
+    // before the drop still decrypt afterwards.
+    final key = await _keys.deriveTransferKey(target.shortId, tid);
+    meshLog(
+      '_startOutgoing target=${target.shortId} '
+      'deviceId=${target.deviceId} key=${key != null} chunks=${chunks.length}',
+    );
+    if (key == null) {
       throw StateError(
-        'No active session with peer ${target.shortId}. '
-        'Complete Noise_XX handshake first.',
+        'No completed handshake with peer ${target.shortId}. '
+        'Connect to the peer first.',
       );
     }
 
-    // Encrypt every chunk before sending.
-    final encrypted = <FileChunk>[];
-    for (final chunk in chunks) {
-      encrypted.add(await AeadCipher.encryptChunk(chunk, sendKey));
+    // Encrypt in place, releasing each plaintext chunk as we go so peak
+    // memory stays near 2× the file size, not 3×.
+    final encrypted = List<FileChunk>.filled(chunks.length, chunks.first);
+    for (var i = 0; i < chunks.length; i++) {
+      encrypted[i] = await AeadCipher.encryptChunk(chunks[i], key);
+      chunks[i] = _emptyChunk;
     }
 
-    final tid = transferId ?? encrypted.first.fileId;
     final transfer = _OutgoingTransfer(
       transferId: tid,
       label: label,
@@ -228,8 +299,42 @@ class TransferManager {
     _outgoing[tid] = transfer;
     _emitProgress(transfer);
 
-    await _sendUnacked(transfer);
     _startRetransmitTimer(transfer);
+    unawaited(_pump(transfer));
+  }
+
+  /// Fill the sliding window: send chunks until [kTransferWindowSize] are in
+  /// flight or every chunk has been sent once. Paced so the OS BLE buffer
+  /// doesn't overrun.
+  Future<void> _pump(_OutgoingTransfer transfer) async {
+    if (transfer.pumping || transfer.isPaused) return;
+    transfer.pumping = true;
+    try {
+      while (transfer.inFlight.length < kTransferWindowSize &&
+          transfer.nextIndex < transfer.chunks.length) {
+        final i = transfer.nextIndex++;
+        if (transfer.ackedIndices.contains(i)) continue;
+        await _sendChunk(transfer, i);
+      }
+    } finally {
+      transfer.pumping = false;
+    }
+  }
+
+  Future<void> _sendChunk(_OutgoingTransfer transfer, int index) async {
+    // Always track it as in-flight; on a send failure we mark it immediately
+    // overdue so the next retransmit tick retries it rather than orphaning it.
+    transfer.inFlight.add(index);
+    try {
+      await _ble.sendChunk(transfer.chunks[index]);
+      transfer.lastSentMs[index] = DateTime.now().millisecondsSinceEpoch;
+    } catch (e) {
+      meshLog('send chunk $index failed: $e');
+      transfer.lastSentMs[index] = 0;
+    }
+    await Future<void>.delayed(
+      const Duration(milliseconds: kChunkSendSpacingMs),
+    );
   }
 
   // ── ACK handling ──────────────────────────────────────────────────────────
@@ -238,22 +343,31 @@ class TransferManager {
     final transfer = _outgoing[ack.fileId];
     if (transfer == null) return;
 
-    transfer.ackedIndices.add(ack.chunkIndex);
+    final isNewAck = transfer.ackedIndices.add(ack.chunkIndex);
+    transfer.inFlight.remove(ack.chunkIndex);
+    if (isNewAck) {
+      transfer.lastProgressMs = DateTime.now().millisecondsSinceEpoch;
+    }
     _emitProgress(transfer);
 
     if (transfer.isComplete) {
       transfer.retransmitTimer?.cancel();
       _outgoing.remove(transfer.transferId);
+      _keys.clearTransferKey(transfer.target.shortId, transfer.transferId);
       _emitProgressEvent(
         transfer.copyWith(progress: 1.0, status: TransferStatus.complete),
       );
       if (transfer.type == PayloadType.message) {
         _messageStore.markDelivered(transfer.transferId, ack.peerId);
       }
+      return;
     }
+
+    // An ACK freed a window slot — send more.
+    if (isNewAck) unawaited(_pump(transfer));
   }
 
-  // ── Retransmission ────────────────────────────────────────────────────────
+  // ── Retransmission / pause-resume ─────────────────────────────────────────
 
   void _startRetransmitTimer(_OutgoingTransfer transfer) {
     transfer.retransmitTimer?.cancel();
@@ -269,65 +383,100 @@ class TransferManager {
       return;
     }
 
-    if (transfer.retryCount >= _OutgoingTransfer.maxRetries) {
-      transfer.retransmitTimer?.cancel();
-      _outgoing.remove(transfer.transferId);
-      _emitProgressEvent(
-        transfer.copyWith(
-          progress: transfer.progress,
-          status: TransferStatus.failed,
-        ),
-      );
-      if (transfer.type == PayloadType.message) {
-        _messageStore.markFailed(transfer.transferId, transfer.target.shortId);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final online = _ble.isPeerOnline(transfer.target.shortId);
+
+    if (!online) {
+      // Peer is gone — park the transfer instead of failing it.
+      transfer.pausedSinceMs ??= now;
+      if (now - transfer.pausedSinceMs! > kTransferPeerReconnectMs) {
+        _failTransfer(transfer, 'peer did not reconnect');
       }
       return;
     }
 
-    transfer.retryCount++;
-    await _sendUnacked(transfer);
-  }
+    if (transfer.isPaused) {
+      // Peer just came back — resume where we left off.
+      meshLog('transfer ${transfer.transferId} resuming after reconnect');
+      transfer.pausedSinceMs = null;
+      transfer.lastProgressMs = now;
+    }
 
-  Future<void> _sendUnacked(_OutgoingTransfer transfer) async {
-    for (final chunk in transfer.unackedChunks) {
+    // Abandon only after a sustained stall *while connected*.
+    if (now - transfer.lastProgressMs > kTransferStallTimeoutMs) {
+      _failTransfer(transfer, 'stalled with no progress');
+      return;
+    }
+
+    // Resend in-flight chunks that have gone unacked too long, then top the
+    // window back up.
+    final overdue = transfer.overdue(now);
+    for (final chunk in overdue) {
       try {
         await _ble.sendChunk(chunk);
+        transfer.lastSentMs[chunk.chunkIndex] =
+            DateTime.now().millisecondsSinceEpoch;
       } catch (_) {
-        // Best-effort per chunk; overall retransmit timer will catch failures.
+        transfer.inFlight.remove(chunk.chunkIndex);
       }
+      await Future<void>.delayed(
+        const Duration(milliseconds: kChunkSendSpacingMs),
+      );
+    }
+    unawaited(_pump(transfer));
+  }
+
+  void _failTransfer(_OutgoingTransfer transfer, String why) {
+    meshLog('transfer ${transfer.transferId} FAILED: $why');
+    transfer.retransmitTimer?.cancel();
+    _outgoing.remove(transfer.transferId);
+    _keys.clearTransferKey(transfer.target.shortId, transfer.transferId);
+    _emitProgressEvent(
+      transfer.copyWith(
+        progress: transfer.progress,
+        status: TransferStatus.failed,
+      ),
+    );
+    if (transfer.type == PayloadType.message) {
+      _messageStore.markFailed(transfer.transferId, transfer.target.shortId);
     }
   }
 
   // ── Receive ───────────────────────────────────────────────────────────────
 
-  Future<void> _onIncomingEncryptedChunk(FileChunk encrypted) async {
+  void _onIncomingEncryptedChunk(FileChunk encrypted) {
+    // Chain onto the queue so events are handled strictly in order.
+    _receiveQueue = _receiveQueue
+        .then((_) => _handleIncomingChunk(encrypted))
+        .catchError((Object e) => meshLog('receive chunk error: $e'));
+  }
+
+  Future<void> _handleIncomingChunk(FileChunk encrypted) async {
     final senderPeerId = encrypted.originPeerId;
 
-    final receiveKey = _keys.sessionReceiveKey(senderPeerId);
-    if (receiveKey == null) return; // no session — drop silently
+    // Same transfer-scoped key the sender used — derived from static keys, so
+    // it's valid even if the Noise session was renegotiated mid-transfer.
+    final key = await _keys.deriveTransferKey(senderPeerId, encrypted.fileId);
+    if (key == null) return; // never handshaked with this sender / not for us
 
-    // Decrypt and verify MAC tag.
     final FileChunk decrypted;
     try {
-      decrypted = await AeadCipher.decryptChunk(encrypted, receiveKey);
+      decrypted = await AeadCipher.decryptChunk(encrypted, key);
     } catch (_) {
-      return; // tampered or wrong key — drop
+      return; // wrong key or tampered — AEAD MAC rejected it
     }
 
-    // Verify SHA-256 checksum of the plaintext.
-    final checksumOk = await _verifyChecksum(decrypted);
-    if (!checksumOk) return;
+    // Defence in depth: the plaintext must match the checksum the sender put
+    // in the chunk header.
+    if (!await _checksumMatches(decrypted)) return;
 
-    // Send ACK back to the original sender — routed by identity, not by a
-    // live GATT link, so this works even when the sender is multiple hops
-    // away.
+    // ACK back to the original sender (routed by identity — works multi-hop).
     await _ble.sendAck(
       fileId: decrypted.fileId,
       chunkIndex: decrypted.chunkIndex,
       originPeerId: senderPeerId,
     );
 
-    // Get or create an assembler for this transfer.
     final incoming = _incoming.putIfAbsent(
       decrypted.fileId,
       () => _IncomingTransfer(
@@ -343,7 +492,7 @@ class TransferManager {
     );
 
     final isNew = incoming.assembler.addChunk(decrypted);
-    if (!isNew) return; // duplicate
+    if (!isNew) return; // duplicate — ACK already re-sent above
 
     _progressController.add(
       TransferProgress(
@@ -361,6 +510,16 @@ class TransferManager {
     }
   }
 
+  Future<bool> _checksumMatches(FileChunk chunk) async {
+    final hash = await _sha256.hash(chunk.data);
+    final expected = chunk.checksum;
+    if (hash.bytes.length != expected.length) return false;
+    for (var i = 0; i < expected.length; i++) {
+      if (hash.bytes[i] != expected[i]) return false;
+    }
+    return true;
+  }
+
   Future<void> _finalise(_IncomingTransfer incoming) async {
     final assembler = incoming.assembler;
     final Uint8List bytes;
@@ -368,10 +527,13 @@ class TransferManager {
       bytes = await assembler.assemble();
     } catch (_) {
       _incoming.remove(assembler.fileId);
+      assembler.discard();
       return;
     }
 
     _incoming.remove(assembler.fileId);
+    assembler.discard();
+    _keys.clearTransferKey(incoming.senderPeerId, assembler.fileId);
 
     if (incoming.type == PayloadType.message) {
       // Decode as UTF-8 text and store in MessageStore.
@@ -429,6 +591,7 @@ class TransferManager {
     final transfer = _outgoing.remove(transferId);
     if (transfer == null) return;
     transfer.retransmitTimer?.cancel();
+    _keys.clearTransferKey(transfer.target.shortId, transfer.transferId);
     _emitProgressEvent(
       transfer.copyWith(
         progress: transfer.progress,
@@ -466,15 +629,6 @@ class TransferManager {
     _progressController.add(event);
   }
 
-  Future<bool> _verifyChecksum(FileChunk chunk) async {
-    try {
-      // FileAssembler.assemble() already verifies; here we do a fast pre-check.
-      // The full SHA-256 verify happens inside assemble(), so we pass here.
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
 
   String _safeFileName(String name) {
     final baseName = p.basename(name).replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');

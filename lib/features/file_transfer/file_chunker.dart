@@ -28,18 +28,20 @@ class FileChunker {
     PayloadType type = PayloadType.file,
     String? transferId, // pass message ID when type == message
     String? fileName,
+    int? payloadBytes, // plaintext bytes per chunk; derived from the link MTU
   }) async {
     final sha256 = Sha256();
     final fileId = transferId ?? generateUuid();
-    final totalChunks = (bytes.length / kBleChunkPayloadBytes).ceil().clamp(
-      1,
-      1 << 31,
-    );
+    final chunkSize =
+        (payloadBytes == null || payloadBytes < kBleChunkPayloadBytes)
+        ? kBleChunkPayloadBytes
+        : payloadBytes;
+    final totalChunks = (bytes.length / chunkSize).ceil().clamp(1, 1 << 31);
     final chunks = <FileChunk>[];
 
     for (int i = 0; i < totalChunks; i++) {
-      final start = i * kBleChunkPayloadBytes;
-      final end = (start + kBleChunkPayloadBytes).clamp(0, bytes.length);
+      final start = i * chunkSize;
+      final end = (start + chunkSize).clamp(0, bytes.length);
       final payload = bytes.sublist(start, end);
 
       final hash = await sha256.hash(payload);

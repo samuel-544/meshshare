@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import '../../core/utils.dart';
+import '../../core/log.dart';
 import '../bluetooth/mesh_node.dart';
 import '../file_transfer/transfer_manager.dart';
 import 'message_model.dart';
@@ -62,6 +63,10 @@ class MessageSender {
       return message;
     }
 
+    meshLog(
+      'MessageSender.send target=${target.shortId} '
+      'isDirect=${target.isDirect} len=${content.length}',
+    );
     await _transferManager.sendMessage(message: message, target: target);
     return message;
   }

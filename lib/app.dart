@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import 'core/theme.dart';
 import 'features/auth/auth_service.dart';
 import 'features/bluetooth/ble_mesh_service.dart';
 import 'features/crypto/key_manager.dart';
@@ -46,7 +48,9 @@ class MeshShareApp extends StatelessWidget {
       child: MaterialApp(
         title: 'MeshShare',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true),
+        theme: buildMeshTheme(),
+        darkTheme: buildMeshTheme(),
+        themeMode: ThemeMode.dark,
         home: const _AppRoot(),
       ),
     );
@@ -67,6 +71,14 @@ class _AppRootState extends State<_AppRoot> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.light,
+        systemNavigationBarColor: MeshColors.bg,
+        systemNavigationBarIconBrightness: Brightness.light,
+      ),
+    );
   }
 
   @override

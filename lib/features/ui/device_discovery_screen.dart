@@ -28,7 +28,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
   final List<String> _logs = [];
   StreamSubscription<MeshNode>? _sub;
   StreamSubscription<MeshNode>? _indirectSub;
-  StreamSubscription<String>? _peerLostSub;
+  StreamSubscription<PeerLostEvent>? _peerLostSub;
   StreamSubscription<String>? _logSub;
   bool _scanning = false;
 
@@ -86,12 +86,16 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
       });
     });
 
-    _peerLostSub = ble.peerLost.listen((shortId) {
+    _peerLostSub = ble.peerLost.listen((event) {
       if (!mounted) return;
       setState(() {
-        _discovered.removeWhere((p) => p.shortId == shortId);
-        _connectingShortIds.remove(shortId);
+        _discovered.removeWhere((p) => p.shortId == event.shortId);
+        _connectingShortIds.remove(event.shortId);
       });
+      final name = context.read<PeerContactStore>().nameFor(event.shortId);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(event.message(name))));
     });
 
     _logSub = ble.discoveryLogs.listen((message) {

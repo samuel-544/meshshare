@@ -6,17 +6,46 @@ library;
 
 // ── BLE ──────────────────────────────────────────────────────────────────────
 
-/// Usable payload per BLE ATT write (MTU 23 − 3 overhead).
+/// Fallback plaintext payload per chunk when the negotiated ATT MTU is
+/// unknown (e.g. before MTU negotiation, or on a link we did not open).
+/// Safe on any BLE stack (MTU 23 − 3 overhead).
 const int kBleChunkPayloadBytes = 20;
+
+/// MTU we ask each GATT link for. Android caps this at 517; most modern
+/// phones grant 512, mid-range devices often 247. The actual chunk size is
+/// derived from whatever gets granted — see [BleMeshService.maxChunkPayloadBytes].
+const int kRequestedMtu = 512;
+
+/// Fixed per-chunk serialisation overhead (fixed header 99 B incl. checksum,
+/// AEAD tag 16 B, mesh type byte 1 B, ATT overhead 3 B) plus an 80 B budget
+/// for the file-name field. Subtracted from the negotiated MTU to get the
+/// safe plaintext payload size per chunk.
+const int kChunkFixedOverheadBytes = 200;
+
+/// Hard cap on plaintext payload per chunk, regardless of MTU — keeps a
+/// relay able to forward without exceeding a smaller onward link's MTU.
+const int kMaxChunkPayloadBytes = 240;
+
+/// Delay between consecutive write-without-response chunk sends (ms).
+/// Write-without-response has no flow control; without a small gap the OS
+/// BLE buffer overruns and chunks are silently dropped.
+const int kChunkSendSpacingMs = 6;
 
 /// Default mesh TTL — maximum hop count before a packet is dropped.
 const int kDefaultTtl = 7;
 
 /// How often to send a keepalive byte on an idle connection (ms).
-const int kKeepaliveIntervalMs = 15000;
+const int kKeepaliveIntervalMs = 12000;
 
-/// Missed keepalive count before a peer is considered disconnected.
-const int kKeepaliveMaxMissed = 3;
+/// Missed keepalive count before a peer is considered disconnected. Combined
+/// with the interval this is ~a minute of total silence — but ANY inbound
+/// traffic from the peer (a chunk, an ACK, a notification) resets the
+/// counter, so an active transfer never trips it.
+const int kKeepaliveMaxMissed = 5;
+
+/// A peer is only declared unreachable if we have neither heard from it nor
+/// received a keepalive echo within this window (ms).
+const int kPeerUnreachableMs = 45000;
 
 /// Active scanning interval when peers are expected nearby (ms).
 const int kScanIntervalActiveMs = 5000;
@@ -33,10 +62,10 @@ const int kDedupCacheMaxSize = 1000;
 // ── Multi-hop mesh routing ───────────────────────────────────────────────────
 
 /// How often each node floods a presence announcement for itself (ms).
-const int kAnnounceIntervalMs = 20000;
+const int kAnnounceIntervalMs = 15000;
 
 /// Drop a gossiped (indirect) peer if it hasn't been re-announced within
-/// this many ms — roughly 2x the announce interval.
+/// this many ms — roughly 3x the announce interval.
 const int kIndirectPeerExpiryMs = 45000;
 
 /// How long to wait for a routed (multi-hop) handshake response before
@@ -49,8 +78,24 @@ const int kRoutedHandshakeTimeoutMs = 12000;
 /// Maximum file size supported in the MVP (50 MB).
 const int kMaxFileSizeBytes = 50 * 1024 * 1024;
 
-/// Milliseconds before an unACKed chunk is retransmitted.
-const int kChunkRetransmitTimeoutMs = 2000;
+/// Milliseconds before an individual unACKed chunk is retransmitted. Only
+/// chunks that have actually been silent this long are resent — not the
+/// whole transfer.
+const int kChunkRetransmitTimeoutMs = 3000;
+
+/// Abandon a transfer only after this many ms of zero forward progress
+/// (no new ACKs at all) *while the peer is connected*. A transfer whose peer
+/// has dropped is paused, not failed — see [kTransferPeerReconnectMs].
+const int kTransferStallTimeoutMs = 45000;
+
+/// How long a paused transfer waits for its peer to come back before it is
+/// abandoned (ms). Covers a walk through a dead spot or a quick BT toggle.
+const int kTransferPeerReconnectMs = 180000;
+
+/// Number of chunks kept in flight at once (sent but not yet ACKed).
+/// ~32 × 240 B ≈ 7.5 KB — enough to saturate a BLE link without overrunning
+/// the write-without-response buffer.
+const int kTransferWindowSize = 32;
 
 // ── GATT UUIDs ────────────────────────────────────────────────────────────────
 // Use a base UUID in the Bluetooth SIG "private" range (128-bit custom UUIDs).

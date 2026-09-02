@@ -9,6 +9,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../../core/constants.dart';
 import '../../core/utils.dart';
+import '../../core/log.dart';
 import '../crypto/key_manager.dart';
 import '../crypto/noise_handshake.dart';
 import '../file_transfer/chunk_model.dart';
@@ -17,6 +18,40 @@ import 'mesh_node.dart';
 import 'platform_channel.dart';
 
 enum TxNotificationType { empty, keepalive, meshPacket, handshakeResponse, unknown }
+
+/// Why a peer stopped being a live direct neighbour.
+enum PeerLostReason {
+  /// The GATT link dropped (peer walked out of range, peer app closed, OS
+  /// tore the connection down).
+  connectionLost,
+
+  /// Repeated keepalives went unanswered and nothing was heard for the
+  /// unreachable window — peer is out of range or its Bluetooth is off.
+  unreachable,
+
+  /// This device's own Bluetooth adapter was turned off.
+  bluetoothOff,
+}
+
+/// A direct neighbour became unavailable. Carries a human-readable reason so
+/// the UI can tell the user *why* a chat/transfer partner went offline.
+class PeerLostEvent {
+  final String shortId;
+  final PeerLostReason reason;
+  const PeerLostEvent(this.shortId, this.reason);
+
+  /// One-line explanation suitable for a snackbar or chat banner.
+  String message(String peerName) => switch (reason) {
+    PeerLostReason.connectionLost =>
+      '$peerName went offline — the Bluetooth connection was lost.',
+    PeerLostReason.unreachable =>
+      '$peerName is no longer reachable. They may be out of range or have '
+          'turned Bluetooth off.',
+    PeerLostReason.bluetoothOff =>
+      'Bluetooth is off on this device — $peerName and other peers are '
+          'disconnected until you turn it back on.',
+  };
+}
 
 @visibleForTesting
 TxNotificationType classifyTxNotification(List<int> bytes) {
@@ -215,7 +250,7 @@ class BleMeshService {
   // ── Stream controllers ────────────────────────────────────────────────────
 
   final _peerController = StreamController<MeshNode>.broadcast();
-  final _peerLostController = StreamController<String>.broadcast();
+  final _peerLostController = StreamController<PeerLostEvent>.broadcast();
   final _indirectPeerController = StreamController<MeshNode>.broadcast();
   final _chunkController = StreamController<FileChunk>.broadcast();
   final _discoveryLogController = StreamController<String>.broadcast();
@@ -229,10 +264,10 @@ class BleMeshService {
   /// a routed (multi-hop) handshake over the mesh.
   Stream<MeshNode> get discoveredPeers => _peerController.stream;
 
-  /// Emits the [MeshNode.shortId] of a peer whose direct GATT link has
-  /// dropped, so the UI can stop showing it as online. Covers links where
-  /// this device is the Central *or* the Peripheral.
-  Stream<String> get peerLost => _peerLostController.stream;
+  /// Emits when a peer's direct GATT link drops, so the UI can stop showing
+  /// it as online and tell the user why. Covers links where this device is
+  /// the Central *or* the Peripheral.
+  Stream<PeerLostEvent> get peerLost => _peerLostController.stream;
 
   /// Emits a [MeshNode] each time a peer is heard about via presence gossip
   /// but has no session yet (`deviceId` is null). Call [requestSecureSession]
@@ -269,6 +304,14 @@ class BleMeshService {
   /// populated for links where we are Central.
   final Map<String, BluetoothCharacteristic> _rxChars = {};
 
+  /// deviceId → MTU granted by that link (0/absent = unknown, use fallback).
+  final Map<String, int> _negotiatedMtu = {};
+
+  /// deviceId → last time we received ANY frame from this peer (Unix ms).
+  /// Used to keep a link alive as long as data is flowing, and to decide
+  /// when a peer is genuinely unreachable.
+  final Map<String, int> _lastHeardFromDevice = {};
+
   /// deviceId → TX characteristic (we subscribe for notifications here).
   final Map<String, BluetoothCharacteristic> _txChars = {};
 
@@ -285,6 +328,30 @@ class BleMeshService {
     ..._connections.keys,
     ..._peers.values.map((n) => n.deviceId).whereType<String>(),
   };
+
+  /// Largest plaintext payload we can safely put in one chunk, derived from
+  /// the smallest MTU across current links (so a relay can forward it too).
+  /// Falls back to [kBleChunkPayloadBytes] when no MTU is known yet.
+  int get maxChunkPayloadBytes {
+    final mtus = _negotiatedMtu.values.where((m) => m > 23);
+    if (mtus.isEmpty) return kBleChunkPayloadBytes;
+    final minMtu = mtus.reduce((a, b) => a < b ? a : b);
+    final usable = minMtu - kChunkFixedOverheadBytes;
+    if (usable < kBleChunkPayloadBytes) return kBleChunkPayloadBytes;
+    return usable > kMaxChunkPayloadBytes ? kMaxChunkPayloadBytes : usable;
+  }
+
+  /// Record that we just received a frame from [deviceId] — any inbound
+  /// traffic proves the link is alive, so it resets the keepalive strike
+  /// count and the unreachable timer.
+  void _notePeerActivity(String deviceId) {
+    _lastHeardFromDevice[deviceId] = DateTime.now().millisecondsSinceEpoch;
+    for (final entry in _peers.entries) {
+      if (entry.value.deviceId == deviceId) {
+        _keepaliveMissed[entry.key] = 0;
+      }
+    }
+  }
 
   // ── Keepalive ─────────────────────────────────────────────────────────────
 
@@ -343,14 +410,25 @@ class BleMeshService {
     // Responder side: a Central dropped its link to our GATT server — clean up
     // that peer so it stops showing as online here.
     _peripheralLinkSub = _channel.peripheralLinkEvents.listen((e) {
+      meshLog('peripheralLink deviceId=${e.deviceId} connected=${e.connected}');
       if (!e.connected) _onDeviceDisconnected(e.deviceId);
     });
 
-    // Watch adapter state — restart scanning if BT is toggled.
+    // Watch adapter state — restart scanning if BT is toggled, and tell the
+    // UI when our own Bluetooth goes off so it can explain the disconnects.
     _adapterSub = FlutterBluePlus.adapterState.listen((state) {
       if (state == BluetoothAdapterState.on && _running) {
         _log('Bluetooth is on.');
         _scheduleAdvertiseRefresh();
+      } else if (state == BluetoothAdapterState.off) {
+        _log('Bluetooth is off — all peers disconnected.');
+        for (final deviceId
+            in _allConnectedDeviceIds.toList(growable: false)) {
+          _onDeviceDisconnected(
+            deviceId,
+            reason: PeerLostReason.bluetoothOff,
+          );
+        }
       }
     });
 
@@ -558,10 +636,27 @@ class BleMeshService {
       _connections[deviceId] = device;
       _connectRetryAfter.remove(deviceId);
 
+      // Ask for the fastest connection interval — roughly 3–4x the default
+      // throughput, which matters a lot for multi-megabyte file transfers.
+      try {
+        await device.requestConnectionPriority(
+          connectionPriorityRequest: ConnectionPriority.high,
+        );
+      } catch (e) {
+        meshLog('requestConnectionPriority failed for $deviceId: $e');
+      }
+
       _log('Preparing secure transfer channel...');
-      // Negotiate a larger MTU so full chunk packets fit in one write.
-      // A chunk packet is ~100 bytes; request 256 to have headroom.
-      await device.requestMtu(256);
+      // Negotiate the largest MTU the link allows so file chunks aren't
+      // fragmented into tiny 20-byte packets. The granted value drives the
+      // actual chunk size — see [maxChunkPayloadBytes].
+      try {
+        final granted = await device.requestMtu(kRequestedMtu);
+        _negotiatedMtu[deviceId] = granted;
+        meshLog('MTU negotiated with $deviceId: $granted');
+      } catch (e) {
+        meshLog('MTU negotiation failed for $deviceId: $e');
+      }
 
       // Listen for disconnection.
       device.connectionState.listen((state) {
@@ -676,10 +771,25 @@ class BleMeshService {
     }
   }
 
-  void _onDeviceDisconnected(String deviceId) {
+  void _onDeviceDisconnected(
+    String deviceId, {
+    PeerLostReason reason = PeerLostReason.connectionLost,
+  }) {
+    // Ignore spurious disconnects for a link that isn't actually ours.
+    final hadLink =
+        _connections.containsKey(deviceId) ||
+        _peers.values.any((n) => n.deviceId == deviceId);
+    if (!hadLink) return;
+
+    meshLog(
+      '_onDeviceDisconnected deviceId=$deviceId reason=$reason '
+      'peersBefore=${_peers.values.map((n) => n.shortId).toList()}',
+    );
     _connections.remove(deviceId);
     _rxChars.remove(deviceId);
     _txChars.remove(deviceId);
+    _negotiatedMtu.remove(deviceId);
+    _lastHeardFromDevice.remove(deviceId);
     final subs = _txNotificationSubs.remove(deviceId);
     if (subs != null) {
       for (final sub in subs) {
@@ -696,7 +806,7 @@ class BleMeshService {
         _keepaliveMissed.remove(peerId);
         _keys.clearSession(node.shortId);
         if (!_peerLostController.isClosed) {
-          _peerLostController.add(node.shortId);
+          _peerLostController.add(PeerLostEvent(node.shortId, reason));
         }
         return true;
       }
@@ -708,6 +818,7 @@ class BleMeshService {
 
   void _startKeepalive(String peerId, String deviceId) {
     _keepaliveMissed[peerId] = 0;
+    _lastHeardFromDevice[deviceId] = DateTime.now().millisecondsSinceEpoch;
     _keepaliveTimers[peerId]?.cancel();
 
     _keepaliveTimers[peerId] = Timer.periodic(
@@ -716,16 +827,35 @@ class BleMeshService {
         final rx = _rxChars[deviceId];
         if (rx == null) return;
 
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final quietFor = now - (_lastHeardFromDevice[deviceId] ?? now);
+
+        // Anything received from the peer recently (chunks, ACKs, gossip,
+        // keepalive echo) means the link is fine — don't even count a strike.
+        if (quietFor < kKeepaliveIntervalMs) {
+          _keepaliveMissed[peerId] = 0;
+        }
+
         try {
           await rx.write([0x00], withoutResponse: true);
-          _keepaliveMissed[peerId] = (_keepaliveMissed[peerId] ?? 0) + 1;
-
-          if ((_keepaliveMissed[peerId] ?? 0) >= kKeepaliveMaxMissed) {
-            // Peer has gone silent — disconnect.
-            _connections[deviceId]?.disconnect();
-          }
         } catch (_) {
-          _onDeviceDisconnected(deviceId);
+          // The write itself failed — the GATT link is gone.
+          _onDeviceDisconnected(deviceId, reason: PeerLostReason.connectionLost);
+          return;
+        }
+
+        _keepaliveMissed[peerId] = (_keepaliveMissed[peerId] ?? 0) + 1;
+
+        final strikes = _keepaliveMissed[peerId] ?? 0;
+        if (strikes >= kKeepaliveMaxMissed && quietFor >= kPeerUnreachableMs) {
+          // Repeated keepalives with zero response AND total silence for the
+          // unreachable window — treat the peer as gone.
+          meshLog(
+            'keepalive: peer $deviceId unreachable '
+            '(strikes=$strikes quietFor=${quietFor}ms)',
+          );
+          _onDeviceDisconnected(deviceId, reason: PeerLostReason.unreachable);
+          _connections[deviceId]?.disconnect();
         }
       },
     );
@@ -741,18 +871,28 @@ class BleMeshService {
   /// byte in every packet and the dedup cache, this is enough to deliver
   /// traffic across multiple hops without a routing table.
   Future<void> _floodSend(Uint8List packet, {String? excludeDeviceId}) async {
-    for (final id in _allConnectedDeviceIds) {
+    final ids = _allConnectedDeviceIds;
+    meshLog(
+      '_floodSend type=0x${packet.isNotEmpty ? packet[0].toRadixString(16) : "?"} '
+      'neighbors=${ids.length} conns=${_connections.keys.toList()} '
+      'peerDevIds=${_peers.values.map((n) => n.deviceId).toList()} '
+      'rxChars=${_rxChars.keys.toList()}',
+    );
+    for (final id in ids) {
       if (id == excludeDeviceId) continue;
       try {
         final rx = _rxChars[id];
         if (rx != null) {
           // We're Central on this link — write to the neighbor's RX char.
           await rx.write(packet, withoutResponse: true);
+          meshLog('_floodSend -> Central write to $id ok');
         } else {
           // We're Peripheral on this link — notify via our TX char.
           await _channel.sendRawNotification(deviceId: id, data: packet);
+          meshLog('_floodSend -> Peripheral notify to $id ok');
         }
-      } catch (_) {
+      } catch (e) {
+        meshLog('_floodSend -> $id failed: $e');
         // Best-effort per-neighbor forward — one bad link shouldn't stop the rest.
       }
     }
@@ -801,6 +941,7 @@ class BleMeshService {
     required List<int> bytes,
   }) {
     if (bytes.isEmpty) return;
+    _notePeerActivity(deviceId);
     final notificationKey = bytes.join(',');
     if (_lastTxNotificationKeys[deviceId] == notificationKey) return;
     _lastTxNotificationKeys[deviceId] = notificationKey;
@@ -834,6 +975,11 @@ class BleMeshService {
   /// relaying to work no matter which role this device has on a given link.
   void _onMeshPacket(String deviceId, Uint8List bytes) {
     if (bytes.isEmpty) return;
+    _notePeerActivity(deviceId);
+    meshLog(
+      '_onMeshPacket from=$deviceId type=0x${bytes[0].toRadixString(16)} '
+      'len=${bytes.length}',
+    );
     final payload = bytes.sublist(1);
     switch (bytes[0] & 0xff) {
       case 0x01:
@@ -850,6 +996,10 @@ class BleMeshService {
   void _handleChunkPacket(String deviceId, Uint8List payload) {
     try {
       final chunk = FileChunk.fromBytes(payload);
+      meshLog(
+        '_handleChunkPacket from=$deviceId dedupKey=${chunk.dedupKey} '
+        'dup=${_dedupCache.contains(chunk.dedupKey)}',
+      );
 
       // Deduplication — drop if this node has already seen this chunk.
       if (_dedupCache.contains(chunk.dedupKey)) return;
@@ -968,8 +1118,13 @@ class BleMeshService {
       final peer = _peers.values
           .where((n) => n.deviceId == deviceId)
           .firstOrNull;
+      meshLog(
+        'initiator handshake done: deviceId=$deviceId '
+        'peerFound=${peer != null} key=${peer?.shortId}',
+      );
       if (peer != null) {
         _keys.storeSession(peer.shortId, result.sendKey, result.receiveKey);
+        _keys.storePeerStaticKey(peer.shortId, result.remoteStaticPublicKey);
         await _contacts?.saveHandshakePeer(
           peerId: peer.shortId,
           deviceName: peer.displayName,
@@ -1004,6 +1159,8 @@ class BleMeshService {
 
   Future<void> _onIncomingHandshakeMessage(HandshakeEvent event) async {
     final deviceId = event.deviceId;
+    _notePeerActivity(deviceId);
+    meshLog('rx handshake step=${event.step} from=$deviceId');
     if (event.step == 1) {
       // Msg1 received — create responder and send msg2 back.
       _log('Nearby peer requested a secure handshake...');
@@ -1034,6 +1191,7 @@ class BleMeshService {
         final peerId = await _keys.identityFor(result.remoteStaticPublicKey);
         final shortPeerId = peerId.substring(0, 16);
         _keys.storeSession(shortPeerId, result.sendKey, result.receiveKey);
+        _keys.storePeerStaticKey(shortPeerId, result.remoteStaticPublicKey);
         final node = MeshNode(
           identity: hexToBytes(peerId),
           deviceId: deviceId,
@@ -1041,6 +1199,10 @@ class BleMeshService {
           lastSeenMs: DateTime.now().millisecondsSinceEpoch,
         );
         _peers[peerId] = node;
+        meshLog(
+          'responder handshake done: session stored key=$shortPeerId '
+          'deviceId=$deviceId',
+        );
         await _contacts?.saveHandshakePeer(peerId: shortPeerId);
         _log('Secure session ready with peer ${shortPeerId.substring(0, 8)}.');
         // Surface the peer on THIS device too. The Central/initiator side
@@ -1222,6 +1384,7 @@ class BleMeshService {
       result.remoteStaticPublicKey,
     );
     _keys.storeSession(peerId, result.sendKey, result.receiveKey);
+    _keys.storePeerStaticKey(peerId, result.remoteStaticPublicKey);
     final node = MeshNode(
       identity: hexToBytes(fullIdentityHex),
       rssi: 0,
@@ -1265,31 +1428,45 @@ class BleMeshService {
   Future<void> _broadcastPresence() async {
     if (!_running) return;
     final myPeerId = (await _keys.localPeerId()).substring(0, 16);
+    final nonce = _randomNonce();
+    meshLog('_broadcastPresence self=$myPeerId nonce=$nonce');
     final packet = buildAnnouncePacket(
       ttl: kDefaultTtl,
       peerId: myPeerId,
-      nonce: _randomNonce(),
+      nonce: nonce,
     );
     await _floodSend(packet);
   }
 
   Future<void> _handleAnnouncePacket(Uint8List payload) async {
     final parsed = parseAnnouncePacket(payload);
-    if (parsed == null) return;
+    if (parsed == null) {
+      meshLog('_handleAnnouncePacket parse FAILED len=${payload.length}');
+      return;
+    }
     final (:ttl, :peerId, :nonce) = parsed;
 
     final myPeerId = (await _keys.localPeerId()).substring(0, 16);
-    if (peerId == myPeerId) return;
+    if (peerId == myPeerId) {
+      meshLog('announce: own echo peerId=$peerId — ignored');
+      return;
+    }
 
     final dedupKey = 'announce:$peerId:$nonce';
-    if (_dedupCache.contains(dedupKey)) return;
+    final dup = _dedupCache.contains(dedupKey);
+    final direct = _peers.values.any((n) => n.shortId == peerId);
+    final knownIndirect = _knownIndirectPeers.containsKey(peerId);
+    meshLog(
+      'announce RX peerId=$peerId nonce=$nonce ttl=$ttl dup=$dup '
+      'direct=$direct knownIndirect=$knownIndirect',
+    );
+    if (dup) return;
     _dedupCache.put(dedupKey);
 
-    final alreadyKnown =
-        _peers.values.any((n) => n.shortId == peerId) ||
-        _knownIndirectPeers.containsKey(peerId);
+    final alreadyKnown = direct || knownIndirect;
     _knownIndirectPeers[peerId] = DateTime.now().millisecondsSinceEpoch;
     if (!alreadyKnown) {
+      meshLog('announce -> emitting INDIRECT peer $peerId');
       _indirectPeerController.add(
         MeshNode(
           identity: _placeholderIdentity(peerId),
@@ -1331,4 +1508,10 @@ class BleMeshService {
 
   /// Returns a snapshot of currently connected peers.
   List<MeshNode> get connectedPeers => List.unmodifiable(_peers.values);
+
+  /// Whether [peerShortId] currently has a live direct GATT link — used by
+  /// the transfer layer to decide whether to keep pushing chunks or park the
+  /// transfer until the peer reconnects.
+  bool isPeerOnline(String peerShortId) =>
+      _peers.values.any((n) => n.shortId == peerShortId && n.deviceId != null);
 }

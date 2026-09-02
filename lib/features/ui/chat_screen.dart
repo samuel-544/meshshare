@@ -1,8 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../bluetooth/ble_mesh_service.dart';
+import '../../core/log.dart';
 import '../bluetooth/mesh_node.dart';
 import '../messaging/message_model.dart';
 import '../messaging/message_sender.dart';
@@ -36,8 +39,38 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<String> _demoTrace = [];
   bool _sending = false;
 
+  /// Non-null while this chat's peer is known to be offline — shown as a
+  /// banner above the input bar so the user knows why sends won't go through.
+  String? _offlineNote;
+  StreamSubscription<PeerLostEvent>? _peerLostSub;
+  StreamSubscription<MeshNode>? _peerBackSub;
+
+  bool _isThisPeer(String shortId) =>
+      shortId == widget.peerId || widget.peerId.startsWith(shortId);
+
+  @override
+  void initState() {
+    super.initState();
+    if (!Platform.isAndroid && !Platform.isIOS) return;
+    final ble = context.read<BleMeshService>();
+    _peerLostSub = ble.peerLost.listen((event) {
+      if (!mounted || !_isThisPeer(event.shortId)) return;
+      final name = context.read<PeerContactStore>().nameFor(
+        widget.peerId,
+        fallback: widget.displayName,
+      );
+      setState(() => _offlineNote = event.message(name));
+    });
+    _peerBackSub = ble.discoveredPeers.listen((node) {
+      if (!mounted || !_isThisPeer(node.shortId)) return;
+      setState(() => _offlineNote = null);
+    });
+  }
+
   @override
   void dispose() {
+    _peerLostSub?.cancel();
+    _peerBackSub?.cancel();
     _inputController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -69,7 +102,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _addDemoReply(store, text);
       }
       _scrollToBottom();
-    } catch (e) {
+    } catch (e, st) {
+      meshLog('chat _sendMessage failed: $e\n$st');
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -200,6 +234,7 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(child: _buildMessageList()),
+          if (_offlineNote != null) _buildOfflineBanner(_offlineNote!),
           if (_demoTrace.isNotEmpty)
             Padding(
               padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
@@ -234,6 +269,34 @@ class _ChatScreenState extends State<ChatScreen> {
           itemBuilder: (_, i) => _MessageBubble(message: messages[i]),
         );
       },
+    );
+  }
+
+  Widget _buildOfflineBanner(String note) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      color: colorScheme.errorContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          Icon(
+            Icons.bluetooth_disabled,
+            size: 18,
+            color: colorScheme.onErrorContainer,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              note,
+              style: TextStyle(
+                fontSize: 13,
+                color: colorScheme.onErrorContainer,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 

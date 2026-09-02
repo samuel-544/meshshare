@@ -1,40 +1,48 @@
 import 'dart:typed_data';
 
-import 'package:cryptography/cryptography.dart';
-
 import 'chunk_model.dart';
 
-/// Collects decrypted [FileChunk]s and reassembles the original file bytes.
+/// Collects decrypted chunk payloads and reassembles the original bytes.
+///
+/// Memory notes: payloads are stored as raw [Uint8List] slices keyed by
+/// index (not whole [FileChunk] objects), and [assemble] writes into one
+/// pre-sized buffer. A 20 MB transfer therefore costs ~2× its size, not the
+/// ~8× a growable `List<int>` used to cost. Chunk integrity (SHA-256) is
+/// verified by the caller as each chunk is decrypted, so it is not re-checked
+/// here.
 class FileAssembler {
   final String fileId;
   final int totalChunks;
 
-  final Map<int, FileChunk> _received = {};
+  final Map<int, Uint8List> _received = {};
 
   FileAssembler({required this.fileId, required this.totalChunks});
 
   /// Returns true if this chunk is new (not a duplicate).
   bool addChunk(FileChunk chunk) {
     if (_received.containsKey(chunk.chunkIndex)) return false;
-    _received[chunk.chunkIndex] = chunk;
+    _received[chunk.chunkIndex] = chunk.data;
     return true;
   }
 
   bool get isComplete => _received.length == totalChunks;
 
-  double get progress => _received.length / totalChunks;
+  double get progress => totalChunks == 0 ? 0 : _received.length / totalChunks;
+
+  int get receivedCount => _received.length;
 
   /// Sorted list of chunk indices still missing.
   List<int> get missingChunks {
-    final all = List.generate(totalChunks, (i) => i).toSet();
-    return all.difference(_received.keys.toSet()).toList()..sort();
+    final missing = <int>[];
+    for (var i = 0; i < totalChunks; i++) {
+      if (!_received.containsKey(i)) missing.add(i);
+    }
+    return missing;
   }
 
-  /// Reassemble and verify all chunks.
+  /// Reassemble all received chunks into the original byte array.
   ///
-  /// Each chunk's [FileChunk.data] must already be *decrypted* plaintext.
-  /// Throws [StateError] if not all chunks received.
-  /// Throws [Exception] if a chunk's checksum does not match.
+  /// Throws [StateError] if not all chunks have been received.
   Future<Uint8List> assemble() async {
     if (!isComplete) {
       throw StateError(
@@ -42,29 +50,21 @@ class FileAssembler {
       );
     }
 
-    final sha256 = Sha256();
-    final sortedChunks = _received.values.toList()
-      ..sort((a, b) => a.chunkIndex.compareTo(b.chunkIndex));
-
-    final buffer = <int>[];
-    for (final chunk in sortedChunks) {
-      final hash = await sha256.hash(chunk.data);
-      if (!_bytesEqual(Uint8List.fromList(hash.bytes), chunk.checksum)) {
-        throw Exception(
-          'Checksum mismatch on chunk ${chunk.chunkIndex} of $fileId',
-        );
-      }
-      buffer.addAll(chunk.data);
+    var total = 0;
+    for (var i = 0; i < totalChunks; i++) {
+      total += _received[i]!.length;
     }
 
-    return Uint8List.fromList(buffer);
+    final out = Uint8List(total);
+    var offset = 0;
+    for (var i = 0; i < totalChunks; i++) {
+      final part = _received[i]!;
+      out.setRange(offset, offset + part.length, part);
+      offset += part.length;
+    }
+    return out;
   }
 
-  bool _bytesEqual(Uint8List a, Uint8List b) {
-    if (a.length != b.length) return false;
-    for (int i = 0; i < a.length; i++) {
-      if (a[i] != b[i]) return false;
-    }
-    return true;
-  }
+  /// Release held chunk data (call after [assemble] or on failure).
+  void discard() => _received.clear();
 }

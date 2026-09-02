@@ -6,6 +6,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/demo_peers.dart';
+import '../../core/theme.dart';
 import '../bluetooth/ble_mesh_service.dart';
 import '../bluetooth/mesh_node.dart';
 import '../crypto/key_manager.dart';
@@ -16,6 +17,7 @@ import 'chat_screen.dart';
 import 'device_discovery_screen.dart';
 import 'receive_file_screen.dart';
 import 'send_file_screen.dart';
+import 'widgets/mesh_logo.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -27,7 +29,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final List<MeshNode> _peers = [];
   StreamSubscription<MeshNode>? _peerSub;
-  StreamSubscription<String>? _peerLostSub;
+  StreamSubscription<PeerLostEvent>? _peerLostSub;
   StreamSubscription<SavedFile>? _savedFileSub;
   bool _scanning = false;
 
@@ -55,9 +57,22 @@ class _HomeScreenState extends State<HomeScreen> {
       });
     });
 
-    _peerLostSub = ble.peerLost.listen((shortId) {
+    _peerLostSub = ble.peerLost.listen((event) {
       if (!mounted) return;
-      setState(() => _peers.removeWhere((p) => p.shortId == shortId));
+      MeshNode? lost;
+      setState(() {
+        final idx = _peers.indexWhere((p) => p.shortId == event.shortId);
+        if (idx >= 0) lost = _peers.removeAt(idx);
+      });
+      if (lost != null) {
+        final name = context.read<PeerContactStore>().nameFor(
+          event.shortId,
+          fallback: lost!.displayName,
+        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(event.message(name))));
+      }
     });
 
     _savedFileSub = tm.savedFiles.listen((file) {
@@ -130,6 +145,8 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
+  // ── Navigation ────────────────────────────────────────────────────────────
+
   void _openSendFile() {
     Navigator.push(
       context,
@@ -154,17 +171,34 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  void _openReceivedFiles() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ReceiveFileScreen()),
+    );
+  }
+
+  void _openChat(String peerId, String name, {MeshNode? target}) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            ChatScreen(peerId: peerId, displayName: name, target: target),
+      ),
+    );
+  }
+
   Future<void> _renamePeer(String peerId, String currentName) async {
     final controller = TextEditingController(text: currentName);
     final name = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Edit Contact Name'),
+        title: const Text('Edit contact name'),
         content: TextField(
           controller: controller,
           autofocus: true,
           textCapitalization: TextCapitalization.words,
-          decoration: const InputDecoration(labelText: 'Name'),
+          decoration: const InputDecoration(hintText: 'Name'),
         ),
         actions: [
           TextButton(
@@ -173,6 +207,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           FilledButton(
             onPressed: () => Navigator.pop(context, controller.text.trim()),
+            style: FilledButton.styleFrom(minimumSize: const Size(0, 44)),
             child: const Text('Save'),
           ),
         ],
@@ -184,242 +219,535 @@ class _HomeScreenState extends State<HomeScreen> {
     await context.read<PeerContactStore>().rename(peerId, name);
   }
 
+  // ── Build ─────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('MeshShare'),
-        actions: [
-          if (_scanning)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            ),
-          IconButton(
-            icon: const Icon(Icons.bluetooth_searching),
-            tooltip: 'Discover Peers',
-            onPressed: _openDiscoverPeers,
-          ),
-          IconButton(
-            icon: const Icon(Icons.download_outlined),
-            tooltip: 'Received Files',
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const ReceiveFileScreen()),
-            ),
-          ),
-        ],
+      body: SafeArea(
+        bottom: false,
+        child: Consumer<PeerContactStore>(
+          builder: (_, contacts, _) {
+            final connectedIds = _peers.map((p) => p.shortId).toSet();
+            final offline = contacts.contacts
+                .where((c) => !connectedIds.contains(c.peerId))
+                .toList();
+
+            return CustomScrollView(
+              slivers: [
+                SliverToBoxAdapter(child: _topBar()),
+                SliverToBoxAdapter(child: _hero()),
+                const SliverToBoxAdapter(child: SizedBox(height: 20)),
+                SliverToBoxAdapter(child: _statusCard()),
+                const SliverToBoxAdapter(child: SizedBox(height: 28)),
+                if (_peers.isNotEmpty) ...[
+                  SliverToBoxAdapter(
+                    child: _SectionHeader('Online now', '${_peers.length}'),
+                  ),
+                  SliverToBoxAdapter(
+                    child: _card(
+                      children: [
+                        for (var i = 0; i < _peers.length; i++) ...[
+                          if (i > 0) const _RowDivider(),
+                          _onlinePeerRow(_peers[i], contacts),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SliverToBoxAdapter(child: SizedBox(height: 26)),
+                ],
+                if (offline.isNotEmpty) ...[
+                  SliverToBoxAdapter(
+                    child: _SectionHeader(
+                      'Saved contacts',
+                      '${offline.length}',
+                    ),
+                  ),
+                  SliverToBoxAdapter(
+                    child: _card(
+                      children: [
+                        for (var i = 0; i < offline.length; i++) ...[
+                          if (i > 0) const _RowDivider(),
+                          _savedRow(offline[i]),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+                if (_peers.isEmpty && offline.isEmpty)
+                  SliverToBoxAdapter(child: _emptyHint()),
+                const SliverToBoxAdapter(child: SizedBox(height: 130)),
+              ],
+            );
+          },
+        ),
       ),
-      body: Consumer<PeerContactStore>(
-        builder: (_, contacts, _) {
-          if (_peers.isEmpty && contacts.contacts.isEmpty) {
-            return _buildEmptyState();
-          }
-          return _buildPeerList(contacts);
-        },
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openSendFile,
-        icon: const Icon(Icons.upload_file),
-        label: const Text('Send File'),
+      extendBody: true,
+      bottomNavigationBar: _MeshBottomBar(
+        onHome: () {},
+        onPeers: _openDiscoverPeers,
+        onFiles: _openReceivedFiles,
+        onSend: _openSendFile,
       ),
     );
   }
 
-  Widget _buildEmptyState() {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.bluetooth_searching,
-            size: 72,
-            color: colorScheme.primary.withAlpha(102),
-          ),
-          const SizedBox(height: 16),
-          Text('No peers found', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 8),
-          Text(
-            'Tap discover, keep Bluetooth on,\nand stay close to nearby devices.',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: colorScheme.onSurface.withAlpha(153),
+  // ── Pieces ────────────────────────────────────────────────────────────────
+
+  Widget _topBar() => Padding(
+    padding: const EdgeInsets.fromLTRB(20, 12, 12, 0),
+    child: Row(
+      children: [
+        const MeshWordmark(),
+        const Spacer(),
+        IconButton(
+          onPressed: _openReceivedFiles,
+          icon: const Icon(Icons.folder_open_outlined),
+          tooltip: 'Received files',
+        ),
+        IconButton(
+          onPressed: _openDiscoverPeers,
+          icon: const Icon(Icons.radar_outlined),
+          tooltip: 'Discover devices',
+        ),
+      ],
+    ),
+  );
+
+  Widget _hero() {
+    final String line1, line2;
+    if (_scanning && _peers.isEmpty) {
+      line1 = 'Looking for';
+      line2 = 'devices nearby';
+    } else if (_peers.isNotEmpty) {
+      line1 = _peers.length == 1 ? '1 device' : '${_peers.length} devices';
+      line2 = 'in range now';
+    } else {
+      line1 = 'Share nearby.';
+      line2 = 'Off the grid.';
+    }
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+      child: RichText(
+        text: TextSpan(
+          style: Theme.of(context).textTheme.displayMedium,
+          children: [
+            TextSpan(text: '$line1\n'),
+            TextSpan(
+              text: line2,
+              style: const TextStyle(color: MeshColors.copper),
             ),
-          ),
-          const SizedBox(height: 20),
-          FilledButton.icon(
-            onPressed: _openDiscoverPeers,
-            icon: const Icon(Icons.bluetooth_searching),
-            label: const Text('Discover Peers'),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildPeerList(PeerContactStore contacts) {
-    final connectedIds = _peers.map((p) => p.shortId).toSet();
-    final offlineContacts = contacts.contacts
-        .where((contact) => !connectedIds.contains(contact.peerId))
-        .toList();
-    final itemCount = _peers.length + offlineContacts.length;
-
-    return ListView.separated(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      itemCount: itemCount,
-      separatorBuilder: (_, _) => const Divider(height: 1),
-      itemBuilder: (_, i) {
-        if (i >= _peers.length) {
-          final contact = offlineContacts[i - _peers.length];
-          return _SavedPeerTile(
-            contact: contact,
-            onChat: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => ChatScreen(
-                  peerId: contact.peerId,
-                  displayName: contact.displayName,
+  Widget _statusCard() {
+    final online = _peers.isNotEmpty;
+    final String status;
+    final Color dot;
+    if (_scanning) {
+      status = 'Scanning for MeshShare devices…';
+      dot = MeshColors.copper;
+    } else if (online) {
+      status = 'Connected to the mesh';
+      dot = MeshColors.success;
+    } else {
+      status = 'Not connected — tap scan to find devices';
+      dot = MeshColors.textFaint;
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Container(
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          color: MeshColors.surface,
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: MeshColors.outline),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                _PulseDot(color: dot, pulsing: _scanning),
+                const SizedBox(width: 10),
+                const Text(
+                  'Mesh status',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.6,
+                    color: MeshColors.textDim,
+                  ),
                 ),
-              ),
+              ],
             ),
-            onRename: () => _renamePeer(contact.peerId, contact.displayName),
-          );
-        }
+            const SizedBox(height: 10),
+            Text(status, style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _scanning ? null : _openDiscoverPeers,
+                    icon: Icon(
+                      _scanning ? Icons.bluetooth_searching : Icons.radar,
+                      size: 19,
+                    ),
+                    label: Text(_scanning ? 'Scanning…' : 'Scan for devices'),
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size.fromHeight(48),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                _SquareButton(
+                  icon: Icons.send_rounded,
+                  onTap: _openSendFile,
+                  tooltip: 'Send a file',
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-        final node = _peers[i];
-        final name = contacts.nameFor(node.shortId, fallback: node.displayName);
-        return _PeerTile(
-          node: node,
-          displayName: name,
-          onChat: () => Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => ChatScreen(
-                peerId: node.shortId,
-                displayName: name,
-                target: node,
+  Widget _card({required List<Widget> children}) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 16),
+    child: Container(
+      decoration: BoxDecoration(
+        color: MeshColors.surface,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: MeshColors.outline),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(children: children),
+    ),
+  );
+
+  Widget _onlinePeerRow(MeshNode node, PeerContactStore contacts) {
+    final name = contacts.nameFor(node.shortId, fallback: node.displayName);
+    return _PeerRow(
+      title: name,
+      subtitle: '${node.shortId} · in range',
+      leading: _Avatar(text: node.shortId.substring(0, 2), online: true),
+      trailing: _RssiBars(rssi: node.rssi),
+      onTap: () => _openChat(node.shortId, name, target: node),
+      onLongPress: () => _peerActions(node.shortId, name, node: node),
+    );
+  }
+
+  Widget _savedRow(PeerContact contact) => _PeerRow(
+    title: contact.displayName,
+    subtitle: '${contact.peerId} · offline',
+    leading: _Avatar(text: contact.displayName, online: false),
+    trailing: const Icon(Icons.chevron_right, color: MeshColors.textFaint),
+    onTap: () => _openChat(contact.peerId, contact.displayName),
+    onLongPress: () => _peerActions(contact.peerId, contact.displayName),
+  );
+
+  void _peerActions(String peerId, String name, {MeshNode? node}) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 8),
+            ListTile(
+              leading: const Icon(Icons.chat_bubble_outline),
+              title: const Text('Open chat'),
+              onTap: () {
+                Navigator.pop(context);
+                _openChat(peerId, name, target: node);
+              },
+            ),
+            if (node != null)
+              ListTile(
+                leading: const Icon(Icons.send_rounded),
+                title: const Text('Send a file'),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => SendFileScreen(target: node),
+                    ),
+                  );
+                },
+              ),
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: const Text('Rename'),
+              onTap: () {
+                Navigator.pop(context);
+                _renamePeer(peerId, name);
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _emptyHint() => Padding(
+    padding: const EdgeInsets.fromLTRB(28, 40, 28, 0),
+    child: Column(
+      children: [
+        Icon(
+          Icons.wifi_tethering_off_rounded,
+          size: 44,
+          color: MeshColors.textFaint,
+        ),
+        const SizedBox(height: 14),
+        Text(
+          'No devices yet',
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+        const SizedBox(height: 6),
+        Text(
+          'Keep Bluetooth on, stay close to another\nMeshShare device, and tap scan.',
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+      ],
+    ),
+  );
+}
+
+// ── Section header ─────────────────────────────────────────────────────────
+
+class _SectionHeader extends StatelessWidget {
+  final String title;
+  final String? count;
+  const _SectionHeader(this.title, [this.count]);
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.fromLTRB(22, 0, 22, 12),
+    child: Row(
+      children: [
+        Text(
+          title.toUpperCase(),
+          style: const TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 1.1,
+            color: MeshColors.textDim,
+          ),
+        ),
+        if (count != null) ...[
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1),
+            decoration: BoxDecoration(
+              color: MeshColors.surfaceHigh,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              count!,
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: MeshColors.textDim,
               ),
             ),
           ),
-          onSendFile: () => Navigator.push(
-            context,
-            MaterialPageRoute(builder: (_) => SendFileScreen(target: node)),
+        ],
+      ],
+    ),
+  );
+}
+
+// ── Peer row ───────────────────────────────────────────────────────────────
+
+class _PeerRow extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final Widget leading;
+  final Widget trailing;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  const _PeerRow({
+    required this.title,
+    required this.subtitle,
+    required this.leading,
+    required this.trailing,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  @override
+  Widget build(BuildContext context) => InkWell(
+    onTap: onTap,
+    onLongPress: onLongPress,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(
+        children: [
+          leading,
+          const SizedBox(width: 13),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: MeshColors.text,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  subtitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: MeshColors.textDim,
+                  ),
+                ),
+              ],
+            ),
           ),
-          onRename: () => _renamePeer(node.shortId, name),
-        );
-      },
+          const SizedBox(width: 10),
+          trailing,
+        ],
+      ),
+    ),
+  );
+}
+
+class _RowDivider extends StatelessWidget {
+  const _RowDivider();
+  @override
+  Widget build(BuildContext context) => const Padding(
+    padding: EdgeInsets.only(left: 62),
+    child: Divider(height: 1),
+  );
+}
+
+class _Avatar extends StatelessWidget {
+  final String text;
+  final bool online;
+  const _Avatar({required this.text, required this.online});
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: MeshColors.surfaceHigh,
+            shape: BoxShape.circle,
+            border: Border.all(color: MeshColors.outline),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            text.substring(0, text.length >= 2 ? 2 : 1).toUpperCase(),
+            style: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: MeshColors.textDim,
+            ),
+          ),
+        ),
+        if (online)
+          Positioned(
+            right: -1,
+            bottom: -1,
+            child: Container(
+              width: 12,
+              height: 12,
+              decoration: BoxDecoration(
+                color: MeshColors.success,
+                shape: BoxShape.circle,
+                border: Border.all(color: MeshColors.surface, width: 2.5),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
 
-// ── Peer list tile ─────────────────────────────────────────────────────────
+// ── Small controls ─────────────────────────────────────────────────────────
 
-class _PeerTile extends StatelessWidget {
-  final MeshNode node;
-  final String displayName;
-  final VoidCallback onChat;
-  final VoidCallback onSendFile;
-  final VoidCallback onRename;
-
-  const _PeerTile({
-    required this.node,
-    required this.displayName,
-    required this.onChat,
-    required this.onSendFile,
-    required this.onRename,
+class _SquareButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+  final String tooltip;
+  const _SquareButton({
+    required this.icon,
+    required this.onTap,
+    required this.tooltip,
   });
 
   @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final initials = node.shortId.substring(0, 2).toUpperCase();
-
-    return ListTile(
-      leading: CircleAvatar(
-        backgroundColor: colorScheme.primaryContainer,
-        child: Text(
-          initials,
-          style: TextStyle(
-            color: colorScheme.onPrimaryContainer,
-            fontWeight: FontWeight.bold,
-          ),
+  Widget build(BuildContext context) => Tooltip(
+    message: tooltip,
+    child: Material(
+      color: MeshColors.surfaceHigh,
+      borderRadius: BorderRadius.circular(14),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: SizedBox(
+          width: 48,
+          height: 48,
+          child: Icon(icon, color: MeshColors.text, size: 20),
         ),
       ),
-      title: Text(displayName),
-      subtitle: Text(node.shortId),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _RssiBars(rssi: node.rssi),
-          const SizedBox(width: 4),
-          IconButton(
-            icon: const Icon(Icons.chat_bubble_outline),
-            tooltip: 'Chat',
-            onPressed: onChat,
-          ),
-          IconButton(
-            icon: const Icon(Icons.edit_outlined),
-            tooltip: 'Edit name',
-            onPressed: onRename,
-          ),
-          IconButton(
-            icon: const Icon(Icons.upload_file),
-            tooltip: 'Send File',
-            onPressed: onSendFile,
-          ),
-        ],
-      ),
-    );
-  }
+    ),
+  );
 }
 
-class _SavedPeerTile extends StatelessWidget {
-  final PeerContact contact;
-  final VoidCallback onChat;
-  final VoidCallback onRename;
+class _PulseDot extends StatefulWidget {
+  final Color color;
+  final bool pulsing;
+  const _PulseDot({required this.color, required this.pulsing});
 
-  const _SavedPeerTile({
-    required this.contact,
-    required this.onChat,
-    required this.onRename,
-  });
+  @override
+  State<_PulseDot> createState() => _PulseDotState();
+}
+
+class _PulseDotState extends State<_PulseDot>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return ListTile(
-      leading: CircleAvatar(
-        backgroundColor: colorScheme.surfaceContainerHighest,
-        child: Text(
-          contact.displayName.substring(0, 1).toUpperCase(),
-          style: TextStyle(
-            color: colorScheme.onSurfaceVariant,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ),
-      title: Text(contact.displayName),
-      subtitle: Text('${contact.peerId} · Offline'),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          IconButton(
-            icon: const Icon(Icons.chat_bubble_outline),
-            tooltip: 'Open chat',
-            onPressed: onChat,
-          ),
-          IconButton(
-            icon: const Icon(Icons.edit_outlined),
-            tooltip: 'Edit name',
-            onPressed: onRename,
-          ),
-        ],
-      ),
+    final dot = Container(
+      width: 9,
+      height: 9,
+      decoration: BoxDecoration(color: widget.color, shape: BoxShape.circle),
+    );
+    if (!widget.pulsing) return dot;
+    return FadeTransition(
+      opacity: Tween(begin: 0.35, end: 1.0).animate(_c),
+      child: dot,
     );
   }
 }
@@ -428,7 +756,6 @@ class _SavedPeerTile extends StatelessWidget {
 
 class _RssiBars extends StatelessWidget {
   final int rssi;
-
   const _RssiBars({required this.rssi});
 
   int get _activeBars {
@@ -439,25 +766,153 @@ class _RssiBars extends StatelessWidget {
   }
 
   @override
+  Widget build(BuildContext context) => Row(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.end,
+    children: List.generate(4, (i) {
+      return Container(
+        width: 3.5,
+        height: 6.0 + i * 4.0,
+        margin: const EdgeInsets.symmetric(horizontal: 1.5),
+        decoration: BoxDecoration(
+          color: i < _activeBars ? MeshColors.copper : MeshColors.outline,
+          borderRadius: BorderRadius.circular(2),
+        ),
+      );
+    }),
+  );
+}
+
+// ── Floating bottom bar ────────────────────────────────────────────────────
+
+class _MeshBottomBar extends StatelessWidget {
+  final VoidCallback onHome;
+  final VoidCallback onPeers;
+  final VoidCallback onFiles;
+  final VoidCallback onSend;
+
+  const _MeshBottomBar({
+    required this.onHome,
+    required this.onPeers,
+    required this.onFiles,
+    required this.onSend,
+  });
+
+  @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: List.generate(4, (i) {
-        final height = 6.0 + i * 4.0;
-        return Container(
-          width: 4,
-          height: height,
-          margin: const EdgeInsets.symmetric(horizontal: 1),
-          decoration: BoxDecoration(
-            color: i < _activeBars
-                ? colorScheme.primary
-                : colorScheme.outline.withAlpha(77),
-            borderRadius: BorderRadius.circular(1),
-          ),
-        );
-      }),
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        22,
+        0,
+        22,
+        14 + MediaQuery.of(context).padding.bottom,
+      ),
+      child: Container(
+        height: 64,
+        decoration: BoxDecoration(
+          color: MeshColors.surfaceHigh,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: MeshColors.outline),
+          boxShadow: const [
+            BoxShadow(
+              color: Colors.black54,
+              blurRadius: 24,
+              offset: Offset(0, 8),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            _BarIcon(icon: Icons.home_rounded, active: true, onTap: onHome),
+            _BarIcon(icon: Icons.groups_2_outlined, onTap: onPeers),
+            _CenterButton(onTap: onSend),
+            _BarIcon(icon: Icons.folder_open_outlined, onTap: onFiles),
+            _BarIcon(
+              icon: Icons.shield_outlined,
+              onTap: () => _showAbout(context),
+            ),
+          ],
+        ),
+      ),
     );
   }
+
+  void _showAbout(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (_) => const _AboutSheet(),
+    );
+  }
+}
+
+class _BarIcon extends StatelessWidget {
+  final IconData icon;
+  final bool active;
+  final VoidCallback onTap;
+  const _BarIcon({required this.icon, required this.onTap, this.active = false});
+
+  @override
+  Widget build(BuildContext context) => Expanded(
+    child: InkResponse(
+      onTap: onTap,
+      radius: 28,
+      child: Icon(
+        icon,
+        size: 23,
+        color: active ? MeshColors.text : MeshColors.textFaint,
+      ),
+    ),
+  );
+}
+
+class _CenterButton extends StatelessWidget {
+  final VoidCallback onTap;
+  const _CenterButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 66,
+    child: Center(
+      child: Material(
+        color: MeshColors.copper,
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: const SizedBox(
+            width: 48,
+            height: 48,
+            child: Icon(Icons.add_rounded, color: MeshColors.copperInk, size: 26),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class _AboutSheet extends StatelessWidget {
+  const _AboutSheet();
+
+  @override
+  Widget build(BuildContext context) => SafeArea(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(24, 22, 24, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const MeshLogo(size: 48),
+          const SizedBox(height: 16),
+          Text('MeshShare', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 6),
+          Text(
+            'Files and messages that travel device-to-device over a '
+            'Bluetooth Low Energy mesh. Nothing touches the internet, and '
+            'every transfer is end-to-end encrypted.',
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+        ],
+      ),
+    ),
+  );
 }

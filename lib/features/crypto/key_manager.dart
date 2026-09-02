@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -29,6 +30,7 @@ class KeyManager {
 
   static final _x25519 = X25519();
   static final _sha256 = Sha256();
+  static final _transferHkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
 
   final Directory _dir;
 
@@ -38,6 +40,14 @@ class KeyManager {
   // Per-session transport keys keyed by peer identity string.
   final Map<String, SecretKey> _sessionSendKeys = {};
   final Map<String, SecretKey> _sessionReceiveKeys = {};
+
+  // Peer static (long-term) public keys, keyed by 16-char shortId. Kept so a
+  // transfer key can be re-derived after the Noise session is re-negotiated.
+  final Map<String, SimplePublicKey> _peerStaticKeys = {};
+
+  // Derived transfer keys, cached by "<peerShortId>:<fileId>" so the X25519 +
+  // HKDF runs once per transfer, not once per chunk.
+  final Map<String, SecretKey> _transferKeys = {};
 
   KeyManager._(this._dir);
 
@@ -118,6 +128,53 @@ class KeyManager {
 
   /// Whether an active session exists for [peerId].
   bool hasSession(String peerId) => _sessionSendKeys.containsKey(peerId);
+
+  // ── Transfer keys ──────────────────────────────────────────────────────────
+
+  /// Remember a peer's long-term Noise static public key (from a completed
+  /// handshake). Needed to derive transfer keys that outlive the session.
+  void storePeerStaticKey(String peerShortId, SimplePublicKey publicKey) {
+    _peerStaticKeys[peerShortId] = publicKey;
+  }
+
+  /// Derive the symmetric key used to encrypt every chunk of transfer
+  /// [fileId] with peer [peerShortId] (a 16-char [MeshNode.shortId]).
+  ///
+  /// The key is `HKDF-SHA256(X25519(myStatic, peerStatic), salt=fileId)`.
+  /// Because it is anchored to the two devices' **static** keys, it stays
+  /// valid even if the live Noise session is torn down and re-negotiated
+  /// mid-transfer — so chunks queued before a reconnect still decrypt.
+  ///
+  /// Returns null if we have never completed a handshake with this peer.
+  Future<SecretKey?> deriveTransferKey(
+    String peerShortId,
+    String fileId,
+  ) async {
+    final cacheKey = '$peerShortId:$fileId';
+    final cached = _transferKeys[cacheKey];
+    if (cached != null) return cached;
+
+    final peerStatic = _peerStaticKeys[peerShortId];
+    if (peerStatic == null) return null;
+
+    final myKeyPair = await getOrCreateStaticKeyPair();
+    final shared = await _x25519.sharedSecretKey(
+      keyPair: myKeyPair,
+      remotePublicKey: peerStatic,
+    );
+    final key = await _transferHkdf.deriveKey(
+      secretKey: shared,
+      nonce: utf8.encode(fileId),
+      info: utf8.encode('meshshare-transfer-v1'),
+    );
+    _transferKeys[cacheKey] = key;
+    return key;
+  }
+
+  /// Drop the cached transfer key for a finished/failed transfer.
+  void clearTransferKey(String peerShortId, String fileId) {
+    _transferKeys.remove('$peerShortId:$fileId');
+  }
 
   // ── Internal ───────────────────────────────────────────────────────────────
 

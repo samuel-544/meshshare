@@ -89,57 +89,70 @@ class _SetupPinScreenState extends State<SetupPinScreen> {
 
     return Scaffold(
       body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 360),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.lock_outline_rounded,
-                    size: 64,
-                    color: colorScheme.primary,
-                  ),
-                  const SizedBox(height: 20),
-                  Text(
-                    _title,
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 360),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 32,
+                      vertical: 16,
                     ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _subtitle,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: colorScheme.onSurface.withAlpha(153),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.lock_outline_rounded,
+                          size: 64,
+                          color: colorScheme.primary,
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          _title,
+                          style: Theme.of(context).textTheme.headlineSmall
+                              ?.copyWith(fontWeight: FontWeight.bold),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          _subtitle,
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: colorScheme.onSurface.withAlpha(153),
+                              ),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 28),
+                        _PinDots(
+                          filled: _input.length,
+                          total: _pinLength,
+                          color: _errorText != null
+                              ? colorScheme.error
+                              : colorScheme.primary,
+                        ),
+                        if (_errorText != null) ...[
+                          const SizedBox(height: 10),
+                          Text(
+                            _errorText!,
+                            style: TextStyle(
+                              color: colorScheme.error,
+                              fontSize: 13,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                        const SizedBox(height: 28),
+                        if (saving)
+                          const CircularProgressIndicator()
+                        else
+                          _NumberPad(onDigit: _onDigit, onDelete: _onDelete),
+                      ],
                     ),
-                    textAlign: TextAlign.center,
                   ),
-                  const SizedBox(height: 28),
-                  _PinDots(
-                    filled: _input.length,
-                    total: _pinLength,
-                    color: _errorText != null
-                        ? colorScheme.error
-                        : colorScheme.primary,
-                  ),
-                  if (_errorText != null) ...[
-                    const SizedBox(height: 10),
-                    Text(
-                      _errorText!,
-                      style: TextStyle(color: colorScheme.error, fontSize: 13),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                  const SizedBox(height: 28),
-                  if (saving)
-                    const CircularProgressIndicator()
-                  else
-                    _NumberPad(onDigit: _onDigit, onDelete: _onDelete),
-                ],
+                ),
               ),
             ),
           ),
@@ -230,67 +243,80 @@ class _LockScreenState extends State<LockScreen> {
 
     return Scaffold(
       body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 360),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.lock_rounded,
-                    size: 64,
-                    color: colorScheme.primary,
-                  ),
-                  const SizedBox(height: 20),
-                  Text(
-                    'MeshShare is locked',
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 360),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 32,
+                      vertical: 16,
                     ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _biometricAvailable
-                        ? 'Use biometrics or enter your PIN.'
-                        : 'Enter your PIN to continue.',
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: colorScheme.onSurface.withAlpha(153),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.lock_rounded,
+                          size: 64,
+                          color: colorScheme.primary,
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          'MeshShare is locked',
+                          style: Theme.of(context).textTheme.headlineSmall
+                              ?.copyWith(fontWeight: FontWeight.bold),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          _biometricAvailable
+                              ? 'Use biometrics or enter your PIN.'
+                              : 'Enter your PIN to continue.',
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: colorScheme.onSurface.withAlpha(153),
+                              ),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 28),
+                        _PinDots(
+                          filled: _input.length,
+                          total: _pinLength,
+                          color: _errorText != null
+                              ? colorScheme.error
+                              : colorScheme.primary,
+                        ),
+                        if (_errorText != null) ...[
+                          const SizedBox(height: 10),
+                          Text(
+                            _errorText!,
+                            style: TextStyle(
+                              color: colorScheme.error,
+                              fontSize: 13,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                        const SizedBox(height: 28),
+                        if (_checking)
+                          const CircularProgressIndicator()
+                        else
+                          _NumberPad(onDigit: _onDigit, onDelete: _onDelete),
+                        if (_biometricAvailable && !_checking) ...[
+                          const SizedBox(height: 20),
+                          FilledButton.tonalIcon(
+                            onPressed: _tryBiometric,
+                            icon: const Icon(Icons.fingerprint),
+                            label: const Text('Use biometric'),
+                          ),
+                        ],
+                      ],
                     ),
-                    textAlign: TextAlign.center,
                   ),
-                  const SizedBox(height: 28),
-                  _PinDots(
-                    filled: _input.length,
-                    total: _pinLength,
-                    color: _errorText != null
-                        ? colorScheme.error
-                        : colorScheme.primary,
-                  ),
-                  if (_errorText != null) ...[
-                    const SizedBox(height: 10),
-                    Text(
-                      _errorText!,
-                      style: TextStyle(color: colorScheme.error, fontSize: 13),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                  const SizedBox(height: 28),
-                  if (_checking)
-                    const CircularProgressIndicator()
-                  else
-                    _NumberPad(onDigit: _onDigit, onDelete: _onDelete),
-                  if (_biometricAvailable && !_checking) ...[
-                    const SizedBox(height: 20),
-                    FilledButton.tonalIcon(
-                      onPressed: _tryBiometric,
-                      icon: const Icon(Icons.fingerprint),
-                      label: const Text('Use biometric'),
-                    ),
-                  ],
-                ],
+                ),
               ),
             ),
           ),

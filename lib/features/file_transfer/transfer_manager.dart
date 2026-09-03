@@ -15,6 +15,7 @@ import '../crypto/aead_cipher.dart';
 import '../crypto/key_manager.dart';
 import '../messaging/message_model.dart';
 import '../messaging/message_store.dart';
+import '../peers/peer_contact_store.dart';
 import 'chunk_model.dart';
 import 'file_assembler.dart';
 import 'file_chunker.dart';
@@ -133,6 +134,12 @@ class TransferManager {
   final KeyManager _keys;
   final MessageStore _messageStore;
 
+  /// Optional block list. When a sender is blocked, inbound chunks from them
+  /// are dropped here — on the local delivery path only. Mesh relaying in
+  /// [BleMeshService] never consults this, so a blocked peer's traffic bound
+  /// for other nodes is still forwarded.
+  final PeerContactStore? _contacts;
+
   // Active outgoing transfers: transferId → state
   final Map<String, _OutgoingTransfer> _outgoing = {};
 
@@ -165,9 +172,11 @@ class TransferManager {
     required BleMeshService ble,
     required KeyManager keys,
     required MessageStore messageStore,
+    PeerContactStore? contacts,
   }) : _ble = ble,
        _keys = keys,
-       _messageStore = messageStore {
+       _messageStore = messageStore,
+       _contacts = contacts {
     // Wire up incoming encrypted chunks.
     _ble.incomingChunks.listen(_onIncomingEncryptedChunk);
     // Wire up ACKs from the BLE layer.
@@ -264,6 +273,13 @@ class TransferManager {
     String? transferId,
   }) async {
     final tid = transferId ?? chunks.first.fileId;
+
+    if (_contacts?.isBlocked(target.shortId) ?? false) {
+      throw StateError(
+        'You have blocked ${target.shortId}. Unblock this contact to send '
+        'messages or files.',
+      );
+    }
 
     // Encrypt every chunk with a transfer-scoped key derived from both
     // devices' *static* keys. Unlike the live Noise session key, this
@@ -453,6 +469,15 @@ class TransferManager {
 
   Future<void> _handleIncomingChunk(FileChunk encrypted) async {
     final senderPeerId = encrypted.originPeerId;
+
+    // Blocked sender: drop before decrypt and before ACK, so no message/file
+    // is delivered and the sender gets no delivery confirmation. This is the
+    // ONLY place a block takes effect — the chunk was already relayed onward
+    // to other neighbours by BleMeshService, so the mesh is unaffected.
+    if (_contacts?.isBlocked(senderPeerId) ?? false) {
+      meshLog('dropping chunk from blocked peer $senderPeerId');
+      return;
+    }
 
     // Same transfer-scoped key the sender used — derived from static keys, so
     // it's valid even if the Noise session was renegotiated mid-transfer.

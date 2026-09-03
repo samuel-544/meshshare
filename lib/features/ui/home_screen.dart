@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
@@ -31,6 +32,7 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription<MeshNode>? _peerSub;
   StreamSubscription<PeerLostEvent>? _peerLostSub;
   StreamSubscription<SavedFile>? _savedFileSub;
+  Timer? _demoFallbackTimer;
   bool _scanning = false;
 
   @override
@@ -64,8 +66,9 @@ class _HomeScreenState extends State<HomeScreen> {
         final idx = _peers.indexWhere((p) => p.shortId == event.shortId);
         if (idx >= 0) lost = _peers.removeAt(idx);
       });
-      if (lost != null) {
-        final name = context.read<PeerContactStore>().nameFor(
+      final contacts = context.read<PeerContactStore>();
+      if (lost != null && !contacts.isBlocked(event.shortId)) {
+        final name = contacts.nameFor(
           event.shortId,
           fallback: lost!.displayName,
         );
@@ -93,7 +96,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     // BLE platform APIs are only available on Android/iOS.
     if (!Platform.isAndroid && !Platform.isIOS) {
-      setState(() => _peers.addAll(buildDemoPeers()));
+      _loadDemoPeers();
       return;
     }
 
@@ -115,7 +118,22 @@ class _HomeScreenState extends State<HomeScreen> {
       // BLE unavailable (e.g. emulator, Bluetooth off) — silent degradation.
     } finally {
       if (mounted) setState(() => _scanning = false);
+      // Debug builds on a device with no working Bluetooth radio (e.g. an
+      // emulator used for a presentation) never discover a real peer. Fall
+      // back to the same demo peers the desktop build uses so the dashboard,
+      // chat and transfer screens have content to show.
+      if (kDebugMode) {
+        _demoFallbackTimer?.cancel();
+        _demoFallbackTimer = Timer(const Duration(seconds: 4), () {
+          if (mounted && _peers.isEmpty) _loadDemoPeers();
+        });
+      }
     }
+  }
+
+  void _loadDemoPeers() {
+    if (!mounted || _peers.isNotEmpty) return;
+    setState(() => _peers.addAll(buildDemoPeers()));
   }
 
   Future<bool> _requestBlePermissions() async {
@@ -142,6 +160,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _peerSub?.cancel();
     _peerLostSub?.cancel();
     _savedFileSub?.cancel();
+    _demoFallbackTimer?.cancel();
     super.dispose();
   }
 
@@ -431,11 +450,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _onlinePeerRow(MeshNode node, PeerContactStore contacts) {
     final name = contacts.nameFor(node.shortId, fallback: node.displayName);
+    final blocked = contacts.isBlocked(node.shortId);
     return _PeerRow(
       title: name,
-      subtitle: '${node.shortId} · in range',
+      subtitle: blocked
+          ? '${node.shortId} · relaying only'
+          : '${node.shortId} · in range',
       leading: _Avatar(text: node.shortId.substring(0, 2), online: true),
-      trailing: _RssiBars(rssi: node.rssi),
+      trailing: blocked ? const _BlockedChip() : _RssiBars(rssi: node.rssi),
       onTap: () => _openChat(node.shortId, name, target: node),
       onLongPress: () => _peerActions(node.shortId, name, node: node),
     );
@@ -443,14 +465,20 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _savedRow(PeerContact contact) => _PeerRow(
     title: contact.displayName,
-    subtitle: '${contact.peerId} · offline',
+    subtitle: contact.blocked
+        ? '${contact.peerId} · blocked'
+        : '${contact.peerId} · offline',
     leading: _Avatar(text: contact.displayName, online: false),
-    trailing: const Icon(Icons.chevron_right, color: MeshColors.textFaint),
+    trailing: contact.blocked
+        ? const _BlockedChip()
+        : const Icon(Icons.chevron_right, color: MeshColors.textFaint),
     onTap: () => _openChat(contact.peerId, contact.displayName),
     onLongPress: () => _peerActions(contact.peerId, contact.displayName),
   );
 
   void _peerActions(String peerId, String name, {MeshNode? node}) {
+    final contacts = context.read<PeerContactStore>();
+    final blocked = contacts.isBlocked(peerId);
     showModalBottomSheet<void>(
       context: context,
       builder: (_) => SafeArea(
@@ -458,38 +486,80 @@ class _HomeScreenState extends State<HomeScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             const SizedBox(height: 8),
-            ListTile(
-              leading: const Icon(Icons.chat_bubble_outline),
-              title: const Text('Open chat'),
-              onTap: () {
-                Navigator.pop(context);
-                _openChat(peerId, name, target: node);
-              },
-            ),
-            if (node != null)
+            if (!blocked) ...[
               ListTile(
-                leading: const Icon(Icons.send_rounded),
-                title: const Text('Send a file'),
+                leading: const Icon(Icons.chat_bubble_outline),
+                title: const Text('Open chat'),
                 onTap: () {
                   Navigator.pop(context);
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => SendFileScreen(target: node),
-                    ),
-                  );
+                  _openChat(peerId, name, target: node);
                 },
               ),
+              if (node != null)
+                ListTile(
+                  leading: const Icon(Icons.send_rounded),
+                  title: const Text('Send a file'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => SendFileScreen(target: node),
+                      ),
+                    );
+                  },
+                ),
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('Rename'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _renamePeer(peerId, name);
+                },
+              ),
+            ],
             ListTile(
-              leading: const Icon(Icons.edit_outlined),
-              title: const Text('Rename'),
+              leading: Icon(
+                blocked ? Icons.person_add_alt_1_outlined : Icons.block,
+                color: blocked ? MeshColors.text : MeshColors.danger,
+              ),
+              title: Text(
+                blocked ? 'Unblock' : 'Block',
+                style: TextStyle(
+                  color: blocked ? MeshColors.text : MeshColors.danger,
+                ),
+              ),
+              subtitle: Text(
+                blocked
+                    ? 'Start receiving messages and files again'
+                    : 'Stop messages and files from this contact',
+              ),
               onTap: () {
                 Navigator.pop(context);
-                _renamePeer(peerId, name);
+                _setBlocked(peerId, name, !blocked);
               },
             ),
             const SizedBox(height: 8),
           ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _setBlocked(String peerId, String name, bool blocked) async {
+    await context.read<PeerContactStore>().setBlocked(
+      peerId,
+      blocked,
+      displayName: name,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          blocked
+              ? '$name blocked. They can still relay mesh traffic, but their '
+                    'messages and files to you are dropped.'
+              : '$name unblocked.',
         ),
       ),
     );
@@ -726,10 +796,27 @@ class _PulseDot extends StatefulWidget {
 
 class _PulseDotState extends State<_PulseDot>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _c = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 1100),
-  )..repeat(reverse: true);
+  late final AnimationController _c;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    );
+    if (widget.pulsing) _c.repeat(reverse: true);
+  }
+
+  @override
+  void didUpdateWidget(_PulseDot old) {
+    super.didUpdateWidget(old);
+    if (widget.pulsing && !_c.isAnimating) {
+      _c.repeat(reverse: true);
+    } else if (!widget.pulsing && _c.isAnimating) {
+      _c.stop();
+    }
+  }
 
   @override
   void dispose() {
@@ -780,6 +867,35 @@ class _RssiBars extends StatelessWidget {
         ),
       );
     }),
+  );
+}
+
+class _BlockedChip extends StatelessWidget {
+  const _BlockedChip();
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+    decoration: BoxDecoration(
+      color: MeshColors.danger.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(999),
+      border: Border.all(color: MeshColors.danger.withValues(alpha: 0.35)),
+    ),
+    child: const Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.block, size: 12, color: MeshColors.danger),
+        SizedBox(width: 5),
+        Text(
+          'Blocked',
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            color: MeshColors.danger,
+          ),
+        ),
+      ],
+    ),
   );
 }
 

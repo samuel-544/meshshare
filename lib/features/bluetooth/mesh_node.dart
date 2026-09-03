@@ -31,6 +31,12 @@ class MeshNode {
   /// Whether this node has a live GATT link (direct neighbor).
   bool get isDirect => deviceId != null;
 
+  /// Whether this is one of the built-in demo peers (see `buildDemoPeers`),
+  /// used on platforms with no BLE radio and on a debug emulator. Lets the
+  /// send/chat flows fall back to the simulated transfer instead of a real
+  /// Noise session that a demo peer never completes.
+  bool get isDemo => deviceId?.startsWith('demo-') ?? false;
+
   /// Hex string of the first 8 bytes of identity — used as short display ID.
   String get shortId =>
       identity.take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join();

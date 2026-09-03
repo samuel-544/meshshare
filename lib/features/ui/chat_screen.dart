@@ -93,12 +93,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final sender = context.read<MessageSender>();
     final store = context.read<MessageStore>();
 
+    final demoMode = (!Platform.isAndroid && !Platform.isIOS) || target.isDemo;
     try {
-      if (!Platform.isAndroid && !Platform.isIOS) {
+      if (demoMode) {
         await _runDemoTrace(text);
       }
       await sender.send(content: text, target: target);
-      if (!Platform.isAndroid && !Platform.isIOS) {
+      if (demoMode) {
         _addDemoReply(store, text);
       }
       _scrollToBottom();

@@ -65,7 +65,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
     });
 
     try {
-      if (!Platform.isAndroid && !Platform.isIOS) {
+      if ((!Platform.isAndroid && !Platform.isIOS) || widget.target.isDemo) {
         // Demo mode: animate a fake transfer progress without real BLE.
         final transferId = 'demo-${DateTime.now().millisecondsSinceEpoch}';
         final events = [

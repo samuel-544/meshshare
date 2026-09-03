@@ -55,7 +55,7 @@ class MessageSender {
     // Optimistically add to the store so the UI shows it immediately.
     _store.upsert(message);
 
-    if (!Platform.isAndroid && !Platform.isIOS) {
+    if ((!Platform.isAndroid && !Platform.isIOS) || target.isDemo) {
       // Demo mode: simulate delivery after a short delay without real BLE.
       Future.delayed(const Duration(milliseconds: 800), () {
         _store.markDelivered(message.messageId, target.shortId);

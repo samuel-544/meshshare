@@ -93,12 +93,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final sender = context.read<MessageSender>();
     final store = context.read<MessageStore>();
 
+    final demoMode = (!Platform.isAndroid && !Platform.isIOS) || target.isDemo;
     try {
-      if (!Platform.isAndroid && !Platform.isIOS) {
+      if (demoMode) {
         await _runDemoTrace(text);
       }
       await sender.send(content: text, target: target);
-      if (!Platform.isAndroid && !Platform.isIOS) {
+      if (demoMode) {
         _addDemoReply(store, text);
       }
       _scrollToBottom();
@@ -191,12 +192,31 @@ class _ChatScreenState extends State<ChatScreen> {
     await context.read<PeerContactStore>().rename(widget.peerId, name);
   }
 
+  Future<void> _setBlocked(bool blocked) async {
+    final store = context.read<PeerContactStore>();
+    final name = store.nameFor(widget.peerId, fallback: widget.displayName);
+    await store.setBlocked(widget.peerId, blocked, displayName: name);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          blocked
+              ? '$name blocked. Their messages and files to you are dropped; '
+                    'they can still relay mesh traffic.'
+              : '$name unblocked.',
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final displayName = context.watch<PeerContactStore>().nameFor(
+    final contacts = context.watch<PeerContactStore>();
+    final displayName = contacts.nameFor(
       widget.peerId,
       fallback: widget.displayName,
     );
+    final blocked = contacts.isBlocked(widget.peerId);
 
     return Scaffold(
       appBar: AppBar(
@@ -218,7 +238,7 @@ class _ChatScreenState extends State<ChatScreen> {
             tooltip: 'Edit name',
             onPressed: () => _renamePeer(displayName),
           ),
-          if (widget.target != null)
+          if (widget.target != null && !blocked)
             IconButton(
               icon: const Icon(Icons.upload_file),
               tooltip: 'Send File',
@@ -229,19 +249,83 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
             ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'block') _setBlocked(true);
+              if (value == 'unblock') _setBlocked(false);
+            },
+            itemBuilder: (_) => [
+              blocked
+                  ? const PopupMenuItem(
+                      value: 'unblock',
+                      child: Text('Unblock contact'),
+                    )
+                  : const PopupMenuItem(
+                      value: 'block',
+                      child: Text(
+                        'Block contact',
+                        style: TextStyle(color: Colors.redAccent),
+                      ),
+                    ),
+            ],
+          ),
         ],
       ),
       body: Column(
         children: [
           Expanded(child: _buildMessageList()),
-          if (_offlineNote != null) _buildOfflineBanner(_offlineNote!),
-          if (_demoTrace.isNotEmpty)
+          if (_offlineNote != null && !blocked)
+            _buildOfflineBanner(_offlineNote!),
+          if (_demoTrace.isNotEmpty && !blocked)
             Padding(
               padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
               child: DemoTransferTrace(events: _demoTrace),
             ),
-          _buildInputBar(),
+          blocked ? _buildBlockedBar() : _buildInputBar(),
         ],
+      ),
+    );
+  }
+
+  Widget _buildBlockedBar() {
+    final colorScheme = Theme.of(context).colorScheme;
+    return SafeArea(
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        decoration: BoxDecoration(
+          color: colorScheme.surface,
+          border: Border(
+            top: BorderSide(color: colorScheme.outlineVariant, width: 0.5),
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.block, size: 18, color: colorScheme.error),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'You blocked this contact. Their messages and files to '
+                    'you are dropped. Unblock to message them again.',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.person_add_alt_1_outlined, size: 18),
+                label: const Text('Unblock'),
+                onPressed: () => _setBlocked(false),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -262,6 +262,7 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
                               node.shortId,
                               fallback: node.displayName,
                             );
+                            final blocked = contacts.isBlocked(node.shortId);
                             return ListTile(
                               leading: CircleAvatar(
                                 child: Text(
@@ -270,10 +271,18 @@ class _DeviceDiscoveryScreenState extends State<DeviceDiscoveryScreen> {
                               ),
                               title: Text(name),
                               subtitle: Text(
-                                '${node.shortId} · RSSI: ${node.rssi} dBm',
+                                blocked
+                                    ? '${node.shortId} · blocked · relaying only'
+                                    : '${node.shortId} · RSSI: ${node.rssi} dBm',
                               ),
-                              trailing: const Icon(Icons.chevron_right),
-                              onTap: () => _selectPeer(node),
+                              trailing: blocked
+                                  ? Icon(
+                                      Icons.block,
+                                      size: 18,
+                                      color: Theme.of(context).colorScheme.error,
+                                    )
+                                  : const Icon(Icons.chevron_right),
+                              onTap: blocked ? null : () => _selectPeer(node),
                             );
                           },
                         ),

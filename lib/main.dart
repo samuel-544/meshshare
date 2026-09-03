@@ -24,6 +24,7 @@ void main() async {
     ble: bleService,
     keys: keyManager,
     messageStore: messageStore,
+    contacts: peerContacts,
   );
   final localPeerId = await keyManager.localPeerId();
   final messageSender = MessageSender(
